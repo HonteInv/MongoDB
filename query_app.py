@@ -1,8 +1,47 @@
+import re
 import streamlit as st
 import asyncio
 import os
 from dotenv import load_dotenv
 from multiagent import build_agent_system
+
+
+def safe_md(text: str) -> str:
+    """Escape bare dollar signs so Streamlit doesn't render them as LaTeX."""
+    return re.sub(r'\$(?=[\d\s(])', r'\\$', text)
+
+
+def revision_controls(section_key: str, section_label: str, result_idx: int = -1):
+    """
+    Render a compact revision input + button for a given section.
+    On submit, stores the pending revision in session state and triggers a rerun.
+    """
+    fb_key  = f"fb_{section_key}"
+    btn_key = f"btn_revise_{section_key}"
+
+    st.markdown("<div style='margin-top:1.2rem;'></div>", unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-label">Revise this section</div>',
+        unsafe_allow_html=True,
+    )
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        feedback = st.text_input(
+            label="feedback",
+            label_visibility="collapsed",
+            placeholder=f"Describe what to change in the {section_label}...",
+            key=fb_key,
+        )
+    with col_btn:
+        pressed = st.button("Revise", key=btn_key, use_container_width=True)
+
+    if pressed and feedback.strip():
+        st.session_state["pending_revision"] = {
+            "section":  section_key,
+            "feedback": feedback.strip(),
+        }
+        st.rerun()
+
 
 load_dotenv()
 
@@ -353,25 +392,84 @@ elif generate:
 # Results — show most recent first
 # ============================================================
 
+# ============================================================
+# Revision execution — runs before display so the updated
+# result is shown immediately in the same render pass.
+# ============================================================
+if st.session_state.get("pending_revision") and st.session_state.history:
+    rev = st.session_state.pop("pending_revision")
+    current = st.session_state.history[-1]["result"]
+    label_map = {
+        "newsletter":  "Newsletter",
+        "risk":        "Risk Analysis",
+        "performance": "Portfolio Performance",
+        "market":      "Market Context",
+    }
+    label = label_map.get(rev["section"], rev["section"].title())
+    with st.spinner(f"Revising {label}..."):
+        updated = asyncio.run(
+            orchestrator.revise_section(rev["section"], rev["feedback"], current)
+        )
+    st.session_state.history[-1]["result"] = updated
+    st.rerun()
+
 if st.session_state.history:
     latest = st.session_state.history[-1]
+    revisions = latest["result"].get("revisions", [])
 
     st.divider()
 
+    # Revision badge — shows how many revisions have been applied
+    if revisions:
+        rev_summary = ", ".join(
+            f"{r['section']} ×{sum(1 for x in revisions if x['section'] == r['section'])}"
+            for r in {r['section']: r for r in revisions}.values()
+        )
+        st.caption(f"✏ {len(revisions)} revision(s) applied — {rev_summary}")
+
     st.subheader("Generated Newsletter")
-    st.markdown(latest["result"]["newsletter"]["newsletter"])
+    st.markdown(safe_md(latest["result"]["newsletter"]["newsletter"]))
+    revision_controls("newsletter", "Newsletter")
 
     with st.expander("View Market Context Analysis"):
-        st.markdown(latest["result"]["market"]["analysis"])
+        st.markdown(safe_md(latest["result"]["market"]["analysis"]))
+        revision_controls("market", "Market Context")
 
     with st.expander("View Portfolio Performance Analysis"):
-        st.markdown(latest["result"]["performance"]["analysis"])
+        st.markdown(safe_md(latest["result"]["performance"]["analysis"]))
+        revision_controls("performance", "Portfolio Performance")
 
     with st.expander("View Risk Analysis"):
-        st.markdown(latest["result"]["risk"]["analysis"])
+        risk = latest["result"]["risk"]
+        metrics = risk.get("metrics", "")
+        if metrics:
+            st.markdown(
+                '<div class="section-label">Portfolio Metrics</div>',
+                unsafe_allow_html=True,
+            )
+            st.code(metrics, language=None)
+            st.divider()
+        st.markdown(
+            '<div class="section-label">Analysis</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(safe_md(risk["analysis"]))
+        revision_controls("risk", "Risk Analysis")
 
     with st.expander("View Weekly Market Data Analysis"):
-        st.markdown(latest["result"]["weekly"]["analysis"])
+        st.markdown(safe_md(latest["result"]["weekly"]["analysis"]))
+
+    # Debug: critique logs — hidden unless admin or debug mode
+    if st.session_state.get("role") == "admin":
+        with st.expander("Debug: Self-Critique Logs", expanded=False):
+            for agent_key, label in [("performance", "Portfolio Performance"), ("newsletter", "Newsletter")]:
+                logs = latest["result"][agent_key].get("critique_log", [])
+                if logs:
+                    st.markdown(f"**{label}** — {len(logs)} critique round(s)")
+                    for i, log in enumerate(logs):
+                        st.markdown(f"Round {i+1}: `{log[:200]}{'...' if len(log) > 200 else ''}`")
+                else:
+                    st.markdown(f"**{label}** — no critique log")
 
     # ── Session history — previous queries this session ────
     if len(st.session_state.history) > 1:
@@ -382,13 +480,18 @@ if st.session_state.history:
         )
         for item in reversed(st.session_state.history[:-1]):
             with st.expander(item["query"][:80]):
-                st.markdown(item["result"]["newsletter"]["newsletter"])
+                st.markdown(safe_md(item["result"]["newsletter"]["newsletter"]))
 
                 with st.expander("Market Context"):
-                    st.markdown(item["result"]["market"]["analysis"])
+                    st.markdown(safe_md(item["result"]["market"]["analysis"]))
                 with st.expander("Portfolio Performance"):
-                    st.markdown(item["result"]["performance"]["analysis"])
+                    st.markdown(safe_md(item["result"]["performance"]["analysis"]))
                 with st.expander("Risk Analysis"):
-                    st.markdown(item["result"]["risk"]["analysis"])
+                    _risk = item["result"]["risk"]
+                    _metrics = _risk.get("metrics", "")
+                    if _metrics:
+                        st.code(_metrics, language=None)
+                        st.divider()
+                    st.markdown(safe_md(_risk["analysis"]))
                 with st.expander("Weekly Market Data"):
-                    st.markdown(item["result"]["weekly"]["analysis"])
+                    st.markdown(safe_md(item["result"]["weekly"]["analysis"]))

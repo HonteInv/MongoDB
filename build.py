@@ -2,22 +2,27 @@
 build.py -> MongoDB ingestion and management pipeline.
 
 Functions:
-    ingest_folder()       — load all docs from a folder into a collection
-    ingest_file()         — load a single file into a collection
-    delete_by_source()    — remove all chunks from a specific source file
-    delete_collection()   — wipe an entire collection
-    deduplicate()         — find and remove duplicate chunks
-    list_sources()        — show all source files in a collection
-    collection_stats()    — document counts and storage info
-    verify_embeddings()   — confirm embedding dimensions are correct
-    reindex_source()      — delete + re-ingest a source file (update flow)
+    ingest_folder()           — load all docs from a folder into a collection
+    ingest_file()             — load a single file into a collection
+    delete_by_source()        — remove all chunks from a specific source file
+    delete_collection()       — wipe an entire collection
+    deduplicate()             — find and remove duplicate chunks
+    list_sources()            — show all source files in a collection
+    collection_stats()        — document counts and storage info
+    verify_embeddings()       — confirm embedding dimensions are correct
+    reindex_source()          — delete + re-ingest a source file (update flow)
+
+    ingest_pnl_structured()   — parse a PnL file into structured row documents (pnl_table)
+    delete_pnl_period()       — delete all rows for a PnL reporting period
+    list_pnl_periods()        — list all PnL periods in pnl_table
 """
 
 import os
+import re
 import csv
 import hashlib
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 from langchain_core.documents import Document
@@ -70,7 +75,7 @@ def get_collection(collection_name: str):
 # ============================================================
 
 COLLECTIONS = {
-    "context":            ("context_vectors",   "vector_index_context"),
+    "context":            ("context_vectors",   "vector_index"),
     "pnl":                ("pnl_vectors",        "vector_index"),
     "newsletter":         ("newsletter_vectors", "vector_index"),
     "weekly_market_data": ("weekly_vectors",     "vector_index"),
@@ -84,6 +89,44 @@ FOLDER_MAP = {
     "newsletter":         BASE_DIR / "data" / "newsletters",
     "weekly_market_data": BASE_DIR / "data" / "weekly_market_data",
 }
+
+# ============================================================
+# Excel Serial Date Conversion
+# ============================================================
+
+# Excel stores dates as days since Dec 30, 1899 (accounts for the
+# intentional Feb 29 1900 bug). When CSVs are exported with columns
+# formatted as General/Number instead of Date, the raw integer leaks
+# into the file instead of a human-readable date string.
+#
+# Valid range: 40000–60000 covers roughly 2009–2064. We use this as
+# a safe heuristic — financial notional values are far larger, and
+# index/ratio values have decimals, so 5-digit integers in this band
+# are almost certainly Excel dates in a PnL context.
+
+_EXCEL_EPOCH = datetime(1899, 12, 30)
+# Exclude matches preceded or followed by a digit or decimal point.
+# This prevents false positives on decimal values like 51850.69071 or 26120.51579,
+# where the integer part or fractional part falls in the Excel date serial range.
+_EXCEL_DATE_RE = re.compile(r"(?<![.\d])(4[0-9]{4}|5[0-9]{4})(?![.\d])")
+
+
+def _excel_serial_to_date(serial: int) -> str:
+    """Convert an Excel date serial number to an ISO date string (YYYY-MM-DD)."""
+    return (_EXCEL_EPOCH + timedelta(days=serial)).strftime("%Y-%m-%d")
+
+
+def convert_excel_dates(text: str) -> str:
+    """
+    Replace Excel serial date integers in document text with ISO date strings.
+    Only replaces standalone 5-digit integers in the range 40000–59999.
+    Safe to call on any text — non-date numbers are left untouched.
+    """
+    def replace_match(m: re.Match) -> str:
+        return _excel_serial_to_date(int(m.group(0)))
+
+    return _EXCEL_DATE_RE.sub(replace_match, text)
+
 
 # ============================================================
 # File Loading
@@ -124,12 +167,16 @@ def load_folder(folder: Path) -> list[Document]:
     return docs
 
 
-def chunk_documents(docs: list[Document], chunk_size=1000, chunk_overlap=200) -> list[Document]:
+def chunk_documents(docs: list[Document], chunk_size=1000, chunk_overlap=200, fix_dates=False) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
-    return splitter.split_documents(docs)
+    chunks = splitter.split_documents(docs)
+    if fix_dates:
+        for chunk in chunks:
+            chunk.page_content = convert_excel_dates(chunk.page_content)
+    return chunks
 
 # ============================================================
 # 1. INGEST — Folder
@@ -173,7 +220,19 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
 
     print(f"  New documents to index: {len(new_docs)}")
 
-    chunks = chunk_documents(new_docs, chunk_size, chunk_overlap)
+    if category == "context":
+        # Larger chunks for prose documents; add period metadata + source prefix
+        chunks = chunk_documents(new_docs, chunk_size=2500, chunk_overlap=400)
+        for chunk in chunks:
+            src_name = Path(chunk.metadata.get("source", "")).name
+            period = _extract_context_period(src_name)
+            if period:
+                chunk.metadata["report_period"] = period
+            if src_name:
+                chunk.page_content = f"[{src_name}]\n{chunk.page_content}"
+    else:
+        chunks = chunk_documents(new_docs, chunk_size, chunk_overlap, fix_dates=(category == "pnl"))
+
     print(f"  Chunks to embed: {len(chunks)}")
 
     MongoDBAtlasVectorSearch.from_documents(
@@ -220,7 +279,17 @@ def ingest_file(file_path: str | Path, category: str, chunk_size=1000, chunk_ove
         print("  No content loaded.")
         return
 
-    chunks = chunk_documents(docs, chunk_size, chunk_overlap)
+    if category == "context":
+        chunks = chunk_documents(docs, chunk_size=2500, chunk_overlap=400)
+        for chunk in chunks:
+            src_name = Path(chunk.metadata.get("source", path.name)).name
+            period = _extract_context_period(src_name)
+            if period:
+                chunk.metadata["report_period"] = period
+            chunk.page_content = f"[{src_name}]\n{chunk.page_content}"
+    else:
+        chunks = chunk_documents(docs, chunk_size, chunk_overlap, fix_dates=(category == "pnl"))
+
     print(f"  {len(chunks)} chunks to embed...")
 
     MongoDBAtlasVectorSearch.from_documents(
@@ -498,6 +567,378 @@ def reindex_source(file_path: str | Path, category: str):
     # Step 2 — re-ingest
     ingest_file(file_path, category)
     print(f"  Reindex complete.")
+
+
+# ============================================================
+# 10. STRUCTURED PnL — pnl_table (replaces vector ingestion)
+# ============================================================
+
+# Month abbreviation → zero-padded number
+_MONTH_ABBR = {
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+    "may": "05", "jun": "06", "jul": "07", "aug": "08",
+    "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+}
+
+# Full + abbreviated month names for context filename parsing
+_CONTEXT_MONTH_MAP = {
+    "january": "01",  "jan": "01",
+    "february": "02", "feb": "02",
+    "march": "03",    "mar": "03",
+    "april": "04",    "apr": "04",
+    "may": "05",
+    "june": "06",     "jun": "06",
+    "july": "07",     "jul": "07",
+    "august": "08",   "aug": "08",
+    "september": "09","sep": "09",
+    "october": "10",  "oct": "10",
+    "november": "11", "nov": "11",
+    "december": "12", "dec": "12",
+}
+
+
+def _extract_context_period(filename: str) -> str | None:
+    """
+    Extract a YYYY-MM period string from a context document filename.
+    Handles the formats found in practice:
+      - YYYYMMDD embedded:   GLOBAL_20260227_0042.pdf       → 2026-02
+      - Month YYYY explicit: Commodity Market Feb 2026.pdf  → 2026-02
+      - MMDDYY 6-digit:      Macro Commentary 120125.pdf    → 2025-12
+      - Month name only:     February 13 Soft CPI.pdf       → 2026-02 (inferred)
+                             August 1 Payroll.pdf            → 2025-08 (inferred)
+    Returns None if no period can be determined.
+    """
+    stem = Path(filename).stem
+    s = stem.lower()
+
+    # 1. YYYYMMDD embedded (e.g. GLOBAL_20260227)
+    m = re.search(r'(20\d{2})(0[1-9]|1[0-2])\d{2}', stem)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+
+    # 2. "Month ... YYYY" or "YYYY ... Month" (explicit year)
+    for name, num in _CONTEXT_MONTH_MAP.items():
+        m = re.search(rf'\b{name}\b.*?\b(20\d{{2}})\b', s)
+        if m:
+            return f"{m.group(1)}-{num}"
+        m = re.search(rf'\b(20\d{{2}})\b.*?\b{name}\b', s)
+        if m:
+            return f"{m.group(1)}-{num}"
+
+    # 3. MMDDYY 6-digit date (e.g. 120125 = Dec 01 2025)
+    m = re.search(r'\b(0[1-9]|1[0-2])(\d{2})(2[0-9])\b', stem)
+    if m:
+        return f"20{m.group(3)}-{m.group(1)}"
+
+    # 4. Month name only — infer year from month
+    #    Jun–Dec files without a year are 2025 uploads; Jan–May are 2026
+    for name, num in _CONTEXT_MONTH_MAP.items():
+        if re.search(rf'\b{name}\b', s):
+            inferred = "2025" if int(num) >= 6 else "2026"
+            return f"{inferred}-{num}"
+
+    return None
+
+
+def _extract_report_period(filename: str) -> str:
+    """
+    Auto-detect a YYYY-MM period string from a PnL filename.
+    e.g. PNL_FEB_2026.md → "2026-02", PNL_OCT.md → "2025-10"
+    """
+    stem = Path(filename).stem.lower()
+    year_match = re.search(r'\b(20\d{2})\b', stem)
+    year = year_match.group(1) if year_match else str(datetime.now(timezone.utc).year)
+    for abbr, num in _MONTH_ABBR.items():
+        if abbr in stem:
+            return f"{year}-{num}"
+    return f"{year}-??"
+
+
+def _normalize_col(name: str) -> str:
+    """Lowercase, strip BOM/special chars, collapse to snake_case."""
+    name = name.replace("ï»¿", "").replace("\ufeff", "").strip()
+    return re.sub(r'[^a-z0-9]+', '_', name.lower()).strip("_")
+
+
+def _parse_number(s: str) -> float | None:
+    """Parse a numeric string, stripping $, commas, parentheses for negatives."""
+    s = str(s).strip().replace("$", "").replace(",", "")
+    s = re.sub(r'^\((.+)\)$', r'-\1', s)  # (1234) → -1234
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_aum_summary(cells: list[str]) -> dict | None:
+    """
+    Extract start_aum, end_aum, total_pnl from the AUM summary row.
+    Row format: | Start AUM | 167820620.6 | End AUM | 175132642.6 | ... | Total PNL | | $7,312,022 | ...
+    """
+    summary = {}
+    for i, cell in enumerate(cells):
+        cl = cell.lower().strip()
+        if "start aum" in cl and i + 1 < len(cells):
+            v = _parse_number(cells[i + 1])
+            if v is not None:
+                summary["start_aum"] = v
+        elif "end aum" in cl and i + 1 < len(cells):
+            v = _parse_number(cells[i + 1])
+            if v is not None:
+                summary["end_aum"] = v
+        elif "total pnl" in cl:
+            # value may be 1-2 cells away (some formats have an empty cell between)
+            for j in range(i + 1, min(i + 3, len(cells))):
+                v = _parse_number(cells[j])
+                if v is not None:
+                    summary["total_pnl"] = v
+                    break
+
+    if "start_aum" in summary and "end_aum" in summary:
+        start, end = summary["start_aum"], summary["end_aum"]
+        if start > 0:
+            summary["return_pct"] = round((end - start) / start * 100, 4)
+
+    return summary if summary else None
+
+
+def _parse_pnl_markdown(path: Path) -> tuple[list[dict], dict | None]:
+    """Parse a PnL markdown table into (row_dicts, aum_summary | None)."""
+    text = convert_excel_dates(path.read_text(encoding="utf-8"))
+    rows = []
+    header = None
+    summary = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+
+        cells = [c.strip() for c in line.strip("|").split("|")]
+
+        # Skip separator rows (| --- | --- |)
+        if all(re.match(r'^-+:?$|^$', c.replace(" ", "")) for c in cells):
+            continue
+
+        if header is None:
+            header = [_normalize_col(c) for c in cells]
+            continue
+
+        # Capture AUM/summary row instead of skipping it
+        if cells and re.search(r'\baum\b', cells[0], re.I):
+            summary = _extract_aum_summary(cells)
+            continue
+
+        if header:
+            row = {header[i]: (cells[i] if i < len(cells) else "") for i in range(len(header))}
+            if any(v.strip() for v in row.values()):
+                rows.append(row)
+
+    return rows, summary
+
+
+def _parse_pnl_csv(path: Path) -> tuple[list[dict], dict | None]:
+    """Parse a PnL CSV file into (row_dicts, aum_summary | None)."""
+    import csv as _csv
+    rows = []
+    summary = None
+    with open(path, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM
+        reader = _csv.DictReader(f)
+        for row in reader:
+            clean = {_normalize_col(k): convert_excel_dates(str(v).strip())
+                     for k, v in row.items() if k}
+            row_keys = " ".join(clean.keys())
+            if re.search(r'\baum\b', row_keys, re.I):
+                # Build a flat cell list for the summary extractor
+                cells = []
+                for k, v in row.items():
+                    cells.append(k or "")
+                    cells.append(v or "")
+                summary = _extract_aum_summary(cells)
+                continue
+            if any(v.strip() for v in clean.values()):
+                rows.append(clean)
+    return rows, summary
+
+
+def ingest_pnl_structured(
+    file_path: str | Path,
+    report_period: str = None,
+    source_name: str = None,
+    uploaded_by: str = "system",
+) -> int:
+    """
+    Parse a PnL .md or .csv file and insert each row as a structured
+    document into the pnl_table collection with a report_period field.
+
+    This replaces vector-based PnL ingestion — queries are exact by period,
+    not semantic similarity.
+
+    report_period is auto-detected from the filename if not provided (YYYY-MM).
+    source_name overrides the filename used for period detection and metadata
+    (useful when file_path is a temp path from Streamlit uploads).
+
+    Usage:
+        ingest_pnl_structured("data/pnl/PNL_FEB_2026.md")
+        ingest_pnl_structured("/tmp/xyz.md", source_name="PNL_MAR_2026.md")
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    display_name = source_name or path.name
+    if report_period is None:
+        report_period = _extract_report_period(display_name)
+
+    print(f"\nIngesting PnL: {display_name} → period={report_period}")
+
+    col = get_collection("pnl_table")
+    existing = col.count_documents({"report_period": report_period})
+    if existing > 0:
+        print(f"  Period {report_period} already has {existing} rows. "
+              f"Call delete_pnl_period('{report_period}') first to replace.")
+        return 0
+
+    ext = path.suffix.lower()
+    if ext == ".md":
+        rows, aum_summary = _parse_pnl_markdown(path)
+    elif ext == ".csv":
+        rows, aum_summary = _parse_pnl_csv(path)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}. Use .md or .csv")
+
+    if not rows:
+        print("  No rows parsed from file.")
+        return 0
+
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        row["report_period"] = report_period
+        row["source_file"] = display_name
+        row["uploaded_by"] = uploaded_by
+        row["uploaded_at"] = now
+
+    col.insert_many(rows)
+    print(f"  Inserted {len(rows)} rows into pnl_table for {report_period}")
+
+    # Store AUM summary for accurate return calculation
+    if aum_summary:
+        summary_col = get_collection("pnl_summary")
+        summary_col.delete_many({"report_period": report_period})  # replace if exists
+        summary_col.insert_one({
+            **aum_summary,
+            "report_period": report_period,
+            "source_file": display_name,
+            "uploaded_by": uploaded_by,
+            "uploaded_at": now,
+        })
+        ret = aum_summary.get("return_pct")
+        print(f"  Stored AUM summary: start={aum_summary.get('start_aum'):,.0f}  "
+              f"end={aum_summary.get('end_aum'):,.0f}  "
+              f"return={ret:+.2f}%" if ret is not None else "  Stored AUM summary (return_pct not computed)")
+
+    return len(rows)
+
+
+def delete_pnl_period(report_period: str, dry_run: bool = False) -> int:
+    """
+    Delete all rows for a specific PnL reporting period from pnl_table and pnl_summary.
+
+    Usage:
+        delete_pnl_period("2026-02")
+        delete_pnl_period("2026-02", dry_run=True)
+    """
+    col = get_collection("pnl_table")
+    count = col.count_documents({"report_period": report_period})
+    if count == 0:
+        print(f"  No rows found for period {report_period}")
+        return 0
+    print(f"  Found {count} rows for period {report_period}")
+    if dry_run:
+        print("  DRY RUN — nothing deleted.")
+        return count
+    col.delete_many({"report_period": report_period})
+    get_collection("pnl_summary").delete_many({"report_period": report_period})
+    print(f"  Deleted {count} rows (+ summary).")
+    return count
+
+
+def get_pnl_summary(report_period: str) -> dict | None:
+    """
+    Return the pre-computed AUM summary for a period, or None if not stored.
+    Keys: start_aum, end_aum, total_pnl, return_pct, report_period
+
+    Usage:
+        s = get_pnl_summary("2026-02")
+        if s:
+            print(f"Return: {s['return_pct']:+.2f}%")
+    """
+    col = get_collection("pnl_summary")
+    doc = col.find_one({"report_period": report_period}, {"_id": 0})
+    return doc
+
+
+def backfill_report_periods(collection_name: str = "context_vectors") -> int:
+    """
+    Add report_period metadata to existing documents that don't have it yet.
+    Derives the period from the stored source filename — no re-embedding needed.
+    Run this once after upgrading to the period-aware ingestion pipeline.
+
+    Usage:
+        backfill_report_periods()
+        backfill_report_periods("context_vectors")
+    """
+    col = get_collection(collection_name)
+    total = col.count_documents({})
+    missing = col.count_documents({"report_period": {"$exists": False}})
+    print(f"\nBackfilling report_period in {collection_name}")
+    print(f"  Total docs: {total}  |  Missing period: {missing}")
+
+    if missing == 0:
+        print("  All documents already have report_period. Nothing to do.")
+        return 0
+
+    updated = 0
+    skipped = 0
+    cursor = col.find(
+        {"report_period": {"$exists": False}},
+        {"_id": 1, "source": 1, "metadata": 1},
+        batch_size=500,
+    )
+    for doc in cursor:
+        src = (
+            doc.get("source")
+            or (doc.get("metadata") or {}).get("source")
+            or ""
+        )
+        src_name = Path(str(src)).name
+        period = _extract_context_period(src_name)
+        if period:
+            col.update_one({"_id": doc["_id"]}, {"$set": {"report_period": period}})
+            updated += 1
+        else:
+            skipped += 1
+
+    print(f"  Updated: {updated}  |  Skipped (no period detectable): {skipped}")
+    return updated
+
+
+def list_pnl_periods() -> list[str]:
+    """
+    List all PnL reporting periods currently in pnl_table.
+
+    Usage:
+        list_pnl_periods()
+    """
+    col = get_collection("pnl_table")
+    periods = sorted(col.distinct("report_period"))
+    print(f"\nPnL periods in pnl_table ({len(periods)}):")
+    for p in periods:
+        count = col.count_documents({"report_period": p})
+        src = col.find_one({"report_period": p}, {"source_file": 1})
+        src_name = (src or {}).get("source_file", "?")
+        print(f"  {p}  —  {count} positions  (from {src_name})")
+    return periods
 
 
 # # ============================================================
