@@ -1,5 +1,5 @@
 """
-Multi-Agent Portfolio Analysis System — MongoDB Backend
+Multi-Agent
 """
 
 import re
@@ -51,7 +51,7 @@ class BaseAgent:
         self.client = anthropic_client
         self.context_k = context_k
 
-        self.model      = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
+        self.model      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
         self.max_tokens = int(os.getenv("CLAUDE_MAX_OUTPUT_TOKENS", "2048"))
         self.temperature = float(os.getenv("CLAUDE_TEMPERATURE", "0"))
 
@@ -156,8 +156,6 @@ class MarketContextAgent(BaseAgent):
             "vector_index",
             self.embedding,
         )
-        # Override model for this agent via env var if a stronger model is available.
-        # e.g. set CLAUDE_CONTEXT_MODEL=claude-3-5-sonnet-20241022 in .env
         context_model = os.getenv("CLAUDE_CONTEXT_MODEL")
         if context_model:
             self.model = context_model
@@ -414,9 +412,6 @@ class WeeklyMarketDataAgent(BaseAgent):
         )
 
     def analyze(self, question: str) -> Dict[str, Any]:
-        # Append a date-anchored suffix so the vector search targets the right
-        # time window within multi-month files rather than finding an older
-        # period with similar vocabulary.
         search_query = f"{question} 2026 weekly market data"
         docs = self._search(self.weekly_store, search_query, k=self.context_k)
 
@@ -473,15 +468,6 @@ class RiskAnalystAgent(BaseAgent):
             return None
 
     def _compute_risk_metrics(self, period: str) -> str:
-        """
-        Query pnl_table for the period and return a structured metrics block:
-          - P&L attribution by asset class ($ and % of total)
-          - Rates DV01 exposure (beginning vs ending)
-          - Top 3 contributors and top 3 detractors
-          - Notional concentration (largest long and short positions)
-
-        Returns a formatted string ready to inject into the risk agent prompt.
-        """
         rows = list(self._pnl_col().find({"report_period": period}, {"_id": 0}))
         if not rows:
             return ""
@@ -525,18 +511,49 @@ class RiskAnalystAgent(BaseAgent):
                 theme_pnl[theme] = theme_pnl.get(theme, 0.0) + pnl_val
                 position_pnls.append((pos_name, theme, pnl_val))
 
-        # ── Rates DV01 (beginning and ending)
-        dv01_beg = 0.0
-        dv01_end = 0.0
+        # ── Rates DV01: net, gross, and curve bucket breakdown
+        # Curve bucket classification by position name keywords (heuristic).
+        # Front end 0–2y: SOFR futures, NZD front end, FF futures, MUNI ratios
+        # Belly 2–10y:    TY (10y Treasury), Gilts (10y), Receiver swaptions (2y1y)
+        # Long end 10y+:  20yr TIPS, 20yr swap spreads, JGB 30y
+        _BUCKET_KEYWORDS = {
+            "front_end": ["sofr", "nzd", "ff futures", "muni", "front end", "green pack"],
+            "belly":     ["ty", "gilt", "swaption", "jgb 10"],
+            "long_end":  ["tips", "20yr", "20y", "jgb 30", "swap spread"],
+        }
+
+        dv01_beg   = 0.0
+        dv01_end   = 0.0
+        dv01_gross = 0.0                          # sum of |DV01| — risk magnitude
+        dv01_buckets: dict[str, float] = {        # ending DV01 by curve bucket
+            "front_end": 0.0, "belly": 0.0, "long_end": 0.0, "unclassified": 0.0
+        }
+        dv01_options = 0.0                        # delta-DV01 from options/swaptions
+
         if beg_col and end_col and type_col:
             for row in rows:
-                if str(row.get(type_col, "")).strip().upper() == "DV01":
-                    b = self._parse_val(row.get(beg_col))
-                    e = self._parse_val(row.get(end_col))
-                    if b is not None:
-                        dv01_beg += b
-                    if e is not None:
-                        dv01_end += e
+                if str(row.get(type_col, "")).strip().upper() != "DV01":
+                    continue
+                b = self._parse_val(row.get(beg_col))
+                e = self._parse_val(row.get(end_col))
+                name_lower = str(row.get(pos_col, "") or "").lower()
+                if b is not None:
+                    dv01_beg += b
+                if e is not None:
+                    dv01_end += e
+                    dv01_gross += abs(e)
+
+                    # Classify into curve bucket
+                    bucket = "unclassified"
+                    for bkt, keywords in _BUCKET_KEYWORDS.items():
+                        if any(kw in name_lower for kw in keywords):
+                            bucket = bkt
+                            break
+                    dv01_buckets[bucket] += e
+
+                    # Flag options (delta-DV01 is not the same as linear DV01)
+                    if "swaption" in name_lower or "option" in name_lower:
+                        dv01_options += abs(e if e is not None else 0)
 
         # ── Notional positions (top 3 longs and shorts by absolute ending notional)
         notional_rows: list[tuple[str, float]] = []
@@ -573,12 +590,28 @@ class RiskAnalystAgent(BaseAgent):
         lines.append("")
 
         # Section 2: Rates DV01
-        if dv01_beg or dv01_end:
+        if dv01_end:
             lines.append("── RATES DV01 EXPOSURE ──")
-            lines.append(f"  Beginning of period:  ${dv01_beg:>12,.0f}")
-            lines.append(f"  End of period:        ${dv01_end:>12,.0f}")
-            change = dv01_end - dv01_beg
-            lines.append(f"  Change (net add/cut): ${change:>+12,.0f}")
+            lines.append(f"  Net DV01  (directional, all same sign = all long):  ${dv01_end:>12,.0f}")
+            lines.append(f"  Gross DV01 (risk magnitude, sum of |DV01|):         ${dv01_gross:>12,.0f}")
+            net_change = dv01_end - dv01_beg
+            lines.append(f"  Change vs period start:                             ${net_change:>+12,.0f}")
+            lines.append("")
+            lines.append("  Curve bucket breakdown (ending DV01):")
+            bucket_labels = {
+                "front_end":     "Front end 0–2y  (SOFR, NZD, FF)",
+                "belly":         "Belly 2–10y     (TY, Gilts, Swaptions)",
+                "long_end":      "Long end 10y+   (TIPS, Swap Spreads, JGB)",
+                "unclassified":  "Unclassified",
+            }
+            for bkt, label in bucket_labels.items():
+                val = dv01_buckets[bkt]
+                if val:
+                    lines.append(f"    {label:<42} ${val:>12,.0f}")
+            if dv01_options:
+                lines.append("")
+                lines.append(f"  ⚑ Of which delta-DV01 from options/swaptions:     ${dv01_options:>12,.0f}")
+                lines.append(f"    (delta-DV01 only — vega exposure requires vol surface data not shown here)")
             lines.append("")
 
         # Section 3: Notional concentration
@@ -611,6 +644,270 @@ class RiskAnalystAgent(BaseAgent):
         lines.append(f"  Top 3 positions account for {concentration_pct:.0f}% of gross P&L")
 
         return "\n".join(lines)
+
+    # ----------------------------------------------------------
+    # Stress test helpers
+    # ----------------------------------------------------------
+
+    def _get_dominant_themes(self, period: str) -> list[str]:
+        """Return the top themes by absolute P&L for scenario selection."""
+        rows = list(self._pnl_col().find({"report_period": period}, {"_id": 0}))
+        if not rows:
+            return []
+        sample = rows[0]
+        pnl_col   = next((k for k in sample if "p_l" in k or "pnl" in k.replace("_", "")), None)
+        class_col = next((k for k in sample if "asset_class" in k or k == "class"), None)
+        theme_map = {
+            "rate": "Rates & Duration", "rates": "Rates & Duration",
+            "equity": "Equities", "fx": "Foreign Exchange",
+            "commodity": "Commodities", "crypto": "Digital Assets",
+        }
+        theme_pnl: dict[str, float] = {}
+        for row in rows:
+            raw = str(row.get(class_col, "") or "").strip().lower()
+            theme = theme_map.get(raw, "Other")
+            val = self._parse_val(row.get(pnl_col)) if pnl_col else None
+            if val is not None:
+                theme_pnl[theme] = theme_pnl.get(theme, 0.0) + val
+        return [t for t, _ in sorted(theme_pnl.items(), key=lambda x: -abs(x[1]))]
+
+    # Ticker substrings → which scenario move field to use
+    _TICKER_MOVE_MAP = {
+        "CNH":   "usdcnh_pct",
+        "HKD":   "usd_dxy_pct",
+        "CHF":   "chfjpy_pct",
+        "JPY":   "chfjpy_pct",
+        "EURGBP": "usd_dxy_pct",
+        "PLJ":   "platinum_pct",   # platinum futures
+        "GDX":   "gold_pct",       # gold miners
+        "CCJ":   "commodities_pct",
+        "HGA":   "commodities_pct",  # copper
+        "IBIT":  "crypto_pct",
+        "ES":    "equities_pct",
+        "DEDZ":  "equities_pct",
+    }
+    _CLASS_MOVE_MAP = {
+        "rate":      "us_10y_bps",
+        "rates":     "us_10y_bps",
+        "equity":    "equities_pct",
+        "fx":        "usd_dxy_pct",
+        "commodity": "commodities_pct",
+        "crypto":    "crypto_pct",
+    }
+
+    def _compute_scenario_impacts(
+        self, rows: list[dict], scenario: dict
+    ) -> dict:
+        """
+        Compute approximate P&L impact of a scenario on each position.
+        Returns a dict with position_impacts list and net_impact float.
+        """
+        sample = rows[0]
+        end_col   = next((k for k in sample if "ending" in k), None)
+        type_col  = next((k for k in sample if "position_type" in k or k == "type"), None)
+        class_col = next((k for k in sample if "asset_class" in k or k == "class"), None)
+        pos_col   = next((k for k in sample if k == "positions"), None)
+        tick_col  = next((k for k in sample if "ticker" in k), None)
+
+        moves = scenario["market_moves"]
+        position_impacts = []
+        net_impact = 0.0
+
+        for row in rows:
+            pos_name    = str(row.get(pos_col, "?") or "?").strip()
+            asset_class = str(row.get(class_col, "") or "").strip().lower()
+            pos_type    = str(row.get(type_col, "") or "").strip().upper()
+            ticker      = str(row.get(tick_col, "") or "").strip().upper()
+            exposure    = self._parse_val(row.get(end_col)) if end_col else None
+
+            if exposure is None or exposure == 0:
+                continue
+
+            impact = None
+            exposure_str = ""
+            move_str = ""
+
+            if pos_type == "DV01":
+                rate_move = moves.get("us_10y_bps")
+                if rate_move is not None:
+                    # Long duration: positive DV01 loses when rates rise
+                    impact = -exposure * rate_move
+                    exposure_str = f"${exposure:>10,.0f} DV01"
+                    move_str = f"{rate_move:+d}bps"
+
+            elif pos_type == "NOTIONAL":
+                # Try ticker-specific override first
+                move_field = next(
+                    (v for k, v in self._TICKER_MOVE_MAP.items() if k in ticker),
+                    None
+                )
+                if move_field is None:
+                    move_field = self._CLASS_MOVE_MAP.get(asset_class)
+
+                if move_field:
+                    pct = moves.get(move_field)
+                    if pct is not None:
+                        impact = exposure * (pct / 100)
+                        exposure_str = f"${exposure:>12,.0f} notl"
+                        move_str = f"{pct:+.0f}%"
+
+            if impact is not None:
+                position_impacts.append({
+                    "position":     pos_name,
+                    "exposure":     exposure_str,
+                    "move":         move_str,
+                    "impact":       impact,
+                })
+                net_impact += impact
+
+        position_impacts.sort(key=lambda x: abs(x["impact"]), reverse=True)
+        return {
+            "scenario":          scenario,
+            "position_impacts":  position_impacts,
+            "net_impact":        net_impact,
+        }
+
+    @staticmethod
+    def _format_impact_table(result: dict) -> str:
+        """Format a single scenario's computed impacts as a readable table."""
+        s = result["scenario"]
+        impacts = result["position_impacts"]
+        net = result["net_impact"]
+
+        lines = [
+            f"SCENARIO: {s['name']}  ({s['period']})",
+            f"Context:  {s['context']}",
+            "",
+            f"{'Position':<38} {'Exposure':>18}  {'Move':>8}  {'Est. P&L Impact':>16}",
+            "-" * 84,
+        ]
+        for p in impacts:
+            if abs(p["impact"]) < 50_000:
+                continue  # skip negligible impacts
+            lines.append(
+                f"{p['position']:<38} {p['exposure']:>18}  {p['move']:>8}  "
+                f"${p['impact']:>+14,.0f}"
+            )
+        lines += [
+            "-" * 84,
+            f"{'NET ESTIMATED IMPACT':<38} {'':>18}  {'':>8}  ${net:>+14,.0f}",
+            "",
+            f"Note: DV01-based estimates assume parallel shift; notional estimates use",
+            f"historical scenario peak-to-trough moves. Actual impact depends on timing",
+            f"and position delta at time of shock.",
+        ]
+        return "\n".join(lines)
+
+    def run_stress_test(
+        self,
+        period: str,
+        question: str,
+        market_context: str,
+        portfolio_performance: str,
+        scenario_keys: list[str] | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Run enhanced stress test with curated scenarios and first-derivative
+        dollar impact estimates.  Called separately from analyze() — only
+        runs when the user opts in via the UI checkbox.
+
+        scenario_keys: list of keys from STRESS_SCENARIOS (e.g. ["2022_rate_shock"]).
+                       If None, auto-selects 2 most relevant based on portfolio themes.
+        """
+        from stress_scenarios import STRESS_SCENARIOS, select_scenarios, format_scenario_for_prompt
+
+        rows = list(self._pnl_col().find({"report_period": period}, {"_id": 0}))
+        if not rows:
+            return {
+                "agent": "StressTest",
+                "error": f"No portfolio data for period {period}",
+                "period": period,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Select scenarios
+        if scenario_keys:
+            scenarios = [STRESS_SCENARIOS[k] for k in scenario_keys if k in STRESS_SCENARIOS]
+        else:
+            dominant = self._get_dominant_themes(period)
+            scenarios = select_scenarios(dominant, n=2)
+
+        if not scenarios:
+            scenarios = [STRESS_SCENARIOS["2022_rate_shock"]]
+
+        # Compute dollar impacts for each scenario
+        impact_results = [self._compute_scenario_impacts(rows, s) for s in scenarios]
+        tables_block   = "\n\n".join(self._format_impact_table(r) for r in impact_results)
+        scenario_block = "\n\n".join(format_scenario_for_prompt(s) for s in scenarios)
+
+        system_prompt = (
+            "You are a senior risk analyst for a global macro hedge fund. "
+            "You have been given pre-computed first-derivative P&L impact estimates "
+            "for specific historical stress scenarios applied to the current portfolio. "
+            "Your job is to write a concise stress test interpretation (400–600 words).\n\n"
+
+            "REQUIRED STRUCTURE:\n"
+            "1. For each scenario: explain the transmission mechanism for the 2–3 largest impacts. "
+            "State which positions drive the loss and through what specific channel "
+            "(e.g. parallel rate shift hitting delta-DV01, not vega).\n"
+            "2. Correlation regime: explicitly state what correlation is assumed "
+            "(e.g. USD strengthens vs CNH in a rate shock) AND what breaks that assumption "
+            "(e.g. PBOC intervention, capital controls). Quantify if possible.\n"
+            "3. Tail risk: identify the single largest unhedged exposure.\n"
+            "4. Risk management: frame recommendations systemically across three dimensions — "
+            "(a) directional duration risk, (b) convexity profile (do positions gain from large moves?), "
+            "(c) correlation risk (what hedges fail if correlations flip?).\n\n"
+
+            "HARD CONSTRAINTS — violating any of these is an error:\n"
+            "- DO NOT describe USDHKD as a hedge to rate shocks. "
+            "The HKD peg mechanically caps upside and peg credibility is a separate risk.\n"
+            "- DO NOT describe USDCNH as a structural hedge. "
+            "CNH behavior is policy-dependent and regime-specific — frame as partial and conditional.\n"
+            "- DO NOT attribute swaption losses to vega compression unless vol surface data is provided. "
+            "The DV01 figures provided are delta-DV01 only. Default to delta as the driver.\n"
+            "- DO NOT infer or speculate about total AUM from position sizes. "
+            "Use only figures explicitly provided in the metrics.\n"
+            "- DO NOT aggregate DV01 to a single portfolio number. "
+            "Reference the curve bucket breakdown (front end / belly / long end) when discussing rate risk.\n"
+            "- Risk recommendations must go beyond position cuts. "
+            "Propose convex hedges (e.g. payer swaptions, tail puts) and address correlation risk explicitly.\n\n"
+
+            "DO NOT repeat numbers from the impact table — it is shown separately above the narrative. "
+            "Reference position names directly. Every claim must be grounded in the provided data."
+        )
+
+        user_prompt = f"""
+Question: {question}
+
+COMPUTED IMPACT TABLES:
+{tables_block}
+
+SCENARIO DETAILS:
+{scenario_block}
+
+Market Context:
+{market_context}
+
+Portfolio Performance:
+{portfolio_performance}
+
+Write the stress test interpretation (400–600 words).
+"""
+
+        narrative = self._call_claude(system_prompt, user_prompt)
+
+        return {
+            "agent":           "StressTest",
+            "tables":          tables_block,
+            "narrative":       narrative,
+            "scenarios_used":  [s["name"] for s in scenarios],
+            "period":          period,
+            "timestamp":       datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ----------------------------------------------------------
+    # Main analysis
+    # ----------------------------------------------------------
 
     def analyze(self, question: str, market_context: str, portfolio_performance: str, feedback: str = "") -> Dict[str, Any]:
         period = _extract_period(question)
@@ -803,7 +1100,18 @@ class OrchestratorAgent:
         self.risk        = RiskAnalystAgent(embedding, anthropic_client, context_k)
         self.writer      = NewsletterWriterAgent(embedding, anthropic_client, context_k)
 
-    async def run_parallel(self, question: str) -> Dict[str, Any]:
+    async def run_parallel(
+        self,
+        question: str,
+        stress_test_options: dict | None = None,
+    ) -> Dict[str, Any]:
+        """
+        stress_test_options (optional):
+            {
+                "period":        "2026-02",          # required
+                "scenario_keys": ["2022_rate_shock"]  # None = auto-select
+            }
+        """
         # Market, performance, and weekly run in parallel
         market_result, perf_result, weekly_result = await asyncio.gather(
             asyncio.to_thread(self.market.analyze, question),
@@ -830,7 +1138,7 @@ class OrchestratorAgent:
             perf_result.get("pnl_summary"),
         )
 
-        return {
+        result = {
             "question":    question,
             "market":      market_result,
             "performance": perf_result,
@@ -839,6 +1147,22 @@ class OrchestratorAgent:
             "newsletter":  writer_result,
             "timestamp":   datetime.now(timezone.utc).isoformat(),
         }
+
+        # Optional stress test — runs after main pipeline
+        if stress_test_options:
+            period = stress_test_options.get("period")
+            scenario_keys = stress_test_options.get("scenario_keys")  # None = auto
+            if period:
+                result["stress_test"] = await asyncio.to_thread(
+                    self.risk.run_stress_test,
+                    period,
+                    question,
+                    market_result["analysis"],
+                    perf_result["analysis"],
+                    scenario_keys,
+                )
+
+        return result
 
     async def revise_section(
         self,

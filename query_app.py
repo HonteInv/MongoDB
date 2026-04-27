@@ -3,7 +3,8 @@ import streamlit as st
 import asyncio
 import os
 from dotenv import load_dotenv
-from multiagent import build_agent_system
+from multiagent import build_agent_system, _extract_period
+from stress_scenarios import STRESS_SCENARIOS
 
 
 def safe_md(text: str) -> str:
@@ -12,10 +13,6 @@ def safe_md(text: str) -> str:
 
 
 def revision_controls(section_key: str, section_label: str, result_idx: int = -1):
-    """
-    Render a compact revision input + button for a given section.
-    On submit, stores the pending revision in session state and triggers a rerun.
-    """
     fb_key  = f"fb_{section_key}"
     btn_key = f"btn_revise_{section_key}"
 
@@ -331,6 +328,14 @@ if not is_authenticated(st.session_state):
 def get_orchestrator():
     return build_agent_system()
 
+@st.cache_data(ttl=300)
+def get_available_periods() -> list[str]:
+    """Fetch PnL periods from MongoDB — cached for 5 min."""
+    from pymongo import MongoClient
+    client = MongoClient(os.getenv("MONGO_URI_USER"))
+    col = client[os.getenv("MONGO_DB_NAME", "portfolio_rag")]["pnl_table"]
+    return sorted(col.distinct("report_period"))
+
 orchestrator = get_orchestrator()
 
 # ============================================================
@@ -364,8 +369,61 @@ with col2:
 query = st.text_area(
     "Enter Request",
     height=160,
-    placeholder="Example: Draft a weekly performance summary..."
+    placeholder="Example: Draft a February 2026 performance summary..."
 )
+
+# ── Stress test controls ──────────────────────────────────────
+run_stress = st.checkbox("Include stress test")
+
+stress_options = None
+if run_stress:
+    available_periods = get_available_periods()
+    auto_period = _extract_period(query) if query.strip() else None
+
+    st.markdown(
+        '<div class="section-label" style="margin-top:0.4rem;">Stress test settings</div>',
+        unsafe_allow_html=True,
+    )
+    col_period, col_mode = st.columns([2, 3])
+
+    with col_period:
+        period_options = available_periods if available_periods else ["(no data)"]
+        default_idx = (
+            period_options.index(auto_period)
+            if auto_period and auto_period in period_options
+            else len(period_options) - 1
+        )
+        selected_period = st.selectbox(
+            "Period",
+            options=period_options,
+            index=default_idx,
+            key="stress_period",
+        )
+
+    with col_mode:
+        scenario_mode = st.radio(
+            "Scenario selection",
+            options=["AI auto-select", "Choose manually"],
+            horizontal=True,
+            key="scenario_mode",
+        )
+
+    selected_keys = None
+    if scenario_mode == "Choose manually":
+        scenario_labels = {v["name"]: k for k, v in STRESS_SCENARIOS.items()}
+        chosen = st.multiselect(
+            "Select scenarios (choose 1–3)",
+            options=list(scenario_labels.keys()),
+            default=list(scenario_labels.keys())[:2],
+            key="stress_scenarios",
+        )
+        selected_keys = [scenario_labels[c] for c in chosen] if chosen else None
+
+    if selected_period and selected_period != "(no data)":
+        stress_options = {
+            "period":        selected_period,
+            "scenario_keys": selected_keys,
+        }
 
 generate = st.button("Generate")
 
@@ -376,7 +434,7 @@ generate = st.button("Generate")
 if generate and query.strip():
     with st.spinner("Running multi-agent analysis..."):
         result = asyncio.run(
-            orchestrator.run_parallel(query)
+            orchestrator.run_parallel(query, stress_test_options=stress_options)
         )
 
     # Save to session history (RAM only — private to this user)
@@ -419,7 +477,6 @@ if st.session_state.history:
 
     st.divider()
 
-    # Revision badge — shows how many revisions have been applied
     if revisions:
         rev_summary = ", ".join(
             f"{r['section']} ×{sum(1 for x in revisions if x['section'] == r['section'])}"
@@ -458,6 +515,27 @@ if st.session_state.history:
 
     with st.expander("View Weekly Market Data Analysis"):
         st.markdown(safe_md(latest["result"]["weekly"]["analysis"]))
+
+    # Stress test results (only shown when enabled)
+    st_result = latest["result"].get("stress_test")
+    if st_result:
+        if st_result.get("error"):
+            with st.expander("⚠ Stress Test — Error"):
+                st.warning(st_result["error"])
+        else:
+            label = "Stress Test Results — " + ", ".join(st_result.get("scenarios_used", []))
+            with st.expander(label, expanded=True):
+                st.markdown(
+                    '<div class="section-label">First-Derivative Impact Estimates</div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(st_result["tables"], language=None)
+                st.divider()
+                st.markdown(
+                    '<div class="section-label">Interpretation</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(safe_md(st_result["narrative"]))
 
     # Debug: critique logs — hidden unless admin or debug mode
     if st.session_state.get("role") == "admin":
