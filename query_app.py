@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from multiagent import build_agent_system, _extract_period
 from stress_scenarios import STRESS_SCENARIOS
+from eval_collector import EvalCollector
 
 
 def safe_md(text: str) -> str:
@@ -352,8 +353,8 @@ if "history" not in st.session_state:
 
 col1, col2 = st.columns([6, 1])
 with col1:
-    st.title("Portfolio Newsletter Generator")
-    st.markdown("Generate portfolio commentary using internal research databases.")
+    st.title("Portfolio AI")
+    st.markdown("Ask anything — newsletter, risk analysis, market brief, stress test.")
 with col2:
     st.markdown("<div style='padding-top: 1.8rem;'></div>", unsafe_allow_html=True)
     if st.button("Logout"):
@@ -368,8 +369,14 @@ with col2:
 
 query = st.text_area(
     "Enter Request",
-    height=160,
-    placeholder="Example: Draft a February 2026 performance summary..."
+    height=120,
+    placeholder=(
+        "Examples:\n"
+        "• Write a February 2026 investor newsletter\n"
+        "• Give me a risk analysis for Feb 2026\n"
+        "• What happened in markets in February?\n"
+        "• Stress test the portfolio against a rate shock"
+    ),
 )
 
 # ── Stress test controls ──────────────────────────────────────
@@ -432,9 +439,9 @@ generate = st.button("Generate")
 # ============================================================
 
 if generate and query.strip():
-    with st.spinner("Running multi-agent analysis..."):
+    with st.spinner("Planning and running agents..."):
         result = asyncio.run(
-            orchestrator.run_parallel(query, stress_test_options=stress_options)
+            orchestrator.run(query, stress_test_options=stress_options)
         )
 
     # Save to session history (RAM only — private to this user)
@@ -442,6 +449,13 @@ if generate and query.strip():
         "query":   query,
         "result":  result,
     })
+
+    # Auto-save to eval_examples collection for future rating / fine-tuning
+    try:
+        category = result.get("plan", {}).get("intent") or result.get("response_type", "unknown")
+        EvalCollector().save_example(result, category=category)
+    except Exception as _e:
+        pass  # never block the UI for this
 
 elif generate:
     st.warning("Please enter a request.")
@@ -471,33 +485,46 @@ if st.session_state.get("pending_revision") and st.session_state.history:
     st.session_state.history[-1]["result"] = updated
     st.rerun()
 
-if st.session_state.history:
-    latest = st.session_state.history[-1]
-    revisions = latest["result"].get("revisions", [])
+def render_plan_badge(result: dict):
+    """Show a small pill describing what the planner decided to run."""
+    plan = result.get("plan")
+    if not plan:
+        return
+    intent      = plan.get("intent", "").replace("_", " ").title()
+    agents_run  = plan.get("agents", [])
+    desc        = plan.get("description", "")
+    reasoning   = plan.get("reasoning", "")
+    badge_parts = [f"🤖 **{intent}**"]
+    if agents_run:
+        badge_parts.append(f"agents: {', '.join(agents_run)}")
+    if reasoning and reasoning != "fallback":
+        badge_parts.append(f"_{reasoning}_")
+    st.caption("  ·  ".join(badge_parts))
+    if desc:
+        st.caption(f"↳ {desc}")
 
-    st.divider()
 
-    if revisions:
-        rev_summary = ", ".join(
-            f"{r['section']} ×{sum(1 for x in revisions if x['section'] == r['section'])}"
-            for r in {r['section']: r for r in revisions}.values()
-        )
-        st.caption(f"✏ {len(revisions)} revision(s) applied — {rev_summary}")
-
-    st.subheader("Generated Newsletter")
-    st.markdown(safe_md(latest["result"]["newsletter"]["newsletter"]))
-    revision_controls("newsletter", "Newsletter")
-
-    with st.expander("View Market Context Analysis"):
-        st.markdown(safe_md(latest["result"]["market"]["analysis"]))
+def render_market_section(result: dict, expanded: bool = True):
+    if "market" not in result:
+        return
+    with st.expander("Market Context Analysis", expanded=expanded):
+        st.markdown(safe_md(result["market"]["analysis"]))
         revision_controls("market", "Market Context")
 
-    with st.expander("View Portfolio Performance Analysis"):
-        st.markdown(safe_md(latest["result"]["performance"]["analysis"]))
+
+def render_performance_section(result: dict, expanded: bool = True):
+    if "performance" not in result:
+        return
+    with st.expander("Portfolio Performance Analysis", expanded=expanded):
+        st.markdown(safe_md(result["performance"]["analysis"]))
         revision_controls("performance", "Portfolio Performance")
 
-    with st.expander("View Risk Analysis"):
-        risk = latest["result"]["risk"]
+
+def render_risk_section(result: dict, expanded: bool = True):
+    if "risk" not in result:
+        return
+    with st.expander("Risk Analysis", expanded=expanded):
+        risk = result["risk"]
         metrics = risk.get("metrics", "")
         if metrics:
             st.markdown(
@@ -513,41 +540,115 @@ if st.session_state.history:
         st.markdown(safe_md(risk["analysis"]))
         revision_controls("risk", "Risk Analysis")
 
-    with st.expander("View Weekly Market Data Analysis"):
-        st.markdown(safe_md(latest["result"]["weekly"]["analysis"]))
 
-    # Stress test results (only shown when enabled)
-    st_result = latest["result"].get("stress_test")
-    if st_result:
-        if st_result.get("error"):
-            with st.expander("⚠ Stress Test — Error"):
-                st.warning(st_result["error"])
+def render_weekly_section(result: dict, expanded: bool = False):
+    if "weekly" not in result:
+        return
+    with st.expander("Weekly Market Data Analysis", expanded=expanded):
+        st.markdown(safe_md(result["weekly"]["analysis"]))
+
+
+def render_stress_test_section(result: dict):
+    st_result = result.get("stress_test")
+    if not st_result:
+        return
+    if st_result.get("error"):
+        with st.expander("⚠ Stress Test — Error"):
+            st.warning(st_result["error"])
+    else:
+        label = "Stress Test — " + ", ".join(st_result.get("scenarios_used", []))
+        with st.expander(label, expanded=True):
+            st.markdown(
+                '<div class="section-label">First-Derivative Impact Estimates</div>',
+                unsafe_allow_html=True,
+            )
+            st.code(st_result["tables"], language=None)
+            st.divider()
+            st.markdown(
+                '<div class="section-label">Interpretation</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(safe_md(st_result["narrative"]))
+
+
+def render_result(result: dict, show_revision_controls: bool = True):
+    """
+    Render a result dict based on its response_type.
+
+    newsletter  → newsletter block front-and-centre, other sections collapsed
+    analysis    → relevant sections expanded, no newsletter block
+    chat        → market context as a clean answer
+    """
+    response_type = result.get("response_type", "newsletter")
+    revisions     = result.get("revisions", [])
+
+    render_plan_badge(result)
+
+    if revisions:
+        rev_summary = ", ".join(
+            f"{r['section']} ×{sum(1 for x in revisions if x['section'] == r['section'])}"
+            for r in {r['section']: r for r in revisions}.values()
+        )
+        st.caption(f"✏ {len(revisions)} revision(s) — {rev_summary}")
+
+    # ── Newsletter layout ─────────────────────────────────────
+    if response_type == "newsletter" and result.get("newsletter"):
+        st.subheader("Generated Newsletter")
+        st.markdown(safe_md(result["newsletter"]["newsletter"]))
+        if show_revision_controls:
+            revision_controls("newsletter", "Newsletter")
+
+        render_market_section(result, expanded=False)
+        render_performance_section(result, expanded=False)
+        render_risk_section(result, expanded=False)
+        render_weekly_section(result, expanded=False)
+        render_stress_test_section(result)
+
+    # ── Analysis layout ───────────────────────────────────────
+    elif response_type in ("analysis", "chat"):
+        # Show market as primary section for chat/market-only queries
+        if result.get("market") and not result.get("performance") and not result.get("risk"):
+            st.markdown(safe_md(result["market"]["analysis"]))
+            if show_revision_controls:
+                revision_controls("market", "Market Context")
         else:
-            label = "Stress Test Results — " + ", ".join(st_result.get("scenarios_used", []))
-            with st.expander(label, expanded=True):
-                st.markdown(
-                    '<div class="section-label">First-Derivative Impact Estimates</div>',
-                    unsafe_allow_html=True,
-                )
-                st.code(st_result["tables"], language=None)
-                st.divider()
-                st.markdown(
-                    '<div class="section-label">Interpretation</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(safe_md(st_result["narrative"]))
+            render_market_section(result, expanded=("market_analysis" in result.get("plan", {}).get("intent", "")))
+            render_performance_section(result, expanded=True)
+            render_risk_section(result, expanded=True)
+            render_weekly_section(result, expanded=False)
 
-    # Debug: critique logs — hidden unless admin or debug mode
-    if st.session_state.get("role") == "admin":
+        render_stress_test_section(result)
+
+    # ── Fallback: show whatever we have ──────────────────────
+    else:
+        if result.get("newsletter"):
+            st.markdown(safe_md(result["newsletter"]["newsletter"]))
+            if show_revision_controls:
+                revision_controls("newsletter", "Newsletter")
+        render_market_section(result, expanded=False)
+        render_performance_section(result, expanded=False)
+        render_risk_section(result, expanded=False)
+        render_weekly_section(result, expanded=False)
+        render_stress_test_section(result)
+
+    # Debug: critique logs — admin only
+    if show_revision_controls and st.session_state.get("role") == "admin":
         with st.expander("Debug: Self-Critique Logs", expanded=False):
-            for agent_key, label in [("performance", "Portfolio Performance"), ("newsletter", "Newsletter")]:
-                logs = latest["result"][agent_key].get("critique_log", [])
+            for agent_key, lbl in [("performance", "Portfolio Performance"), ("newsletter", "Newsletter")]:
+                logs = result.get(agent_key, {}).get("critique_log", [])
                 if logs:
-                    st.markdown(f"**{label}** — {len(logs)} critique round(s)")
+                    st.markdown(f"**{lbl}** — {len(logs)} critique round(s)")
                     for i, log in enumerate(logs):
                         st.markdown(f"Round {i+1}: `{log[:200]}{'...' if len(log) > 200 else ''}`")
                 else:
-                    st.markdown(f"**{label}** — no critique log")
+                    st.markdown(f"**{lbl}** — no critique log")
+
+
+if st.session_state.history:
+    latest = st.session_state.history[-1]
+
+    st.divider()
+    render_result(latest["result"], show_revision_controls=True)
 
     # ── Session history — previous queries this session ────
     if len(st.session_state.history) > 1:
@@ -557,19 +658,6 @@ if st.session_state.history:
             unsafe_allow_html=True
         )
         for item in reversed(st.session_state.history[:-1]):
-            with st.expander(item["query"][:80]):
-                st.markdown(safe_md(item["result"]["newsletter"]["newsletter"]))
-
-                with st.expander("Market Context"):
-                    st.markdown(safe_md(item["result"]["market"]["analysis"]))
-                with st.expander("Portfolio Performance"):
-                    st.markdown(safe_md(item["result"]["performance"]["analysis"]))
-                with st.expander("Risk Analysis"):
-                    _risk = item["result"]["risk"]
-                    _metrics = _risk.get("metrics", "")
-                    if _metrics:
-                        st.code(_metrics, language=None)
-                        st.divider()
-                    st.markdown(safe_md(_risk["analysis"]))
-                with st.expander("Weekly Market Data"):
-                    st.markdown(safe_md(item["result"]["weekly"]["analysis"]))
+            label = item["query"][:80]
+            with st.expander(label):
+                render_result(item["result"], show_revision_controls=False)

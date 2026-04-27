@@ -1099,6 +1099,217 @@ class OrchestratorAgent:
         self.weekly      = WeeklyMarketDataAgent(embedding, anthropic_client, context_k)
         self.risk        = RiskAnalystAgent(embedding, anthropic_client, context_k)
         self.writer      = NewsletterWriterAgent(embedding, anthropic_client, context_k)
+        self._anthropic  = anthropic_client
+
+    # ----------------------------------------------------------
+    # Planner: lightweight intent classification
+    # ----------------------------------------------------------
+
+    async def _plan_execution(self, query: str) -> dict:
+        """
+        One cheap Claude call that reads the query and returns a JSON plan:
+        which agents to run, in what order, and what response format to use.
+
+        Falls back to the full pipeline on any failure so the user always
+        gets a result.
+
+        Returns:
+        {
+          "intent":        "newsletter|market_analysis|performance|risk_analysis|
+                            stress_test|full_brief|qa",
+          "description":   "one-sentence summary of what was requested",
+          "period":        "2026-02 | null",
+          "response_type": "newsletter|analysis|chat",
+          "agents":        ["performance", "market", ...],   # ordered
+          "reasoning":     "brief explanation"
+        }
+
+        Agent dependency rules (enforced at execution time, not here):
+          risk        requires performance + market
+          newsletter  requires performance + market + risk
+          stress_test requires performance + market
+        """
+        import json
+
+        # Fetch available periods for the planner's context
+        available_periods: list[str] = []
+        try:
+            from pymongo import MongoClient
+            _c = MongoClient(os.getenv("MONGO_URI_USER"))
+            _col = _c[os.getenv("MONGO_DB_NAME", "portfolio_rag")]["pnl_table"]
+            available_periods = sorted(_col.distinct("report_period"))
+        except Exception:
+            pass
+        periods_str = ", ".join(available_periods) if available_periods else "unknown"
+
+        system_prompt = (
+            "You are a routing agent for a portfolio analysis system. "
+            "Given a user query, determine exactly what they want and which agents to run.\n\n"
+            "Available agents:\n"
+            "  performance  — portfolio P&L, returns, attribution for a specific period\n"
+            "  market       — macro market context (rates, FX, equities, central banks)\n"
+            "  weekly       — weekly market data trends\n"
+            "  risk         — risk analysis with DV01, notional, concentration (needs performance + market)\n"
+            "  newsletter   — full investor letter (needs performance + market + risk)\n"
+            "  stress_test  — scenario stress test (needs performance + market)\n\n"
+            f"Available data periods: {periods_str}\n\n"
+            "Intent → agent mapping (use EXACTLY these agent lists):\n"
+            "  newsletter       → [performance, market, weekly, risk, newsletter]\n"
+            "  market_analysis  → [market, weekly]\n"
+            "  performance      → [performance]\n"
+            "  risk_analysis    → [performance, market, risk]\n"
+            "  stress_test      → [performance, market, stress_test]\n"
+            "  full_brief       → [performance, market, weekly, risk]\n"
+            "  qa               → [market]\n\n"
+            "response_type rules:\n"
+            "  newsletter intent              → response_type: newsletter\n"
+            "  market/performance/risk/brief  → response_type: analysis\n"
+            "  qa / general question          → response_type: chat\n\n"
+            "If the user asks for 'analysis', 'brief', 'summary' without mentioning a newsletter → full_brief.\n"
+            "If the user mentions 'stress test' or 'scenario' → stress_test.\n"
+            "If unsure → newsletter (safest default).\n\n"
+            "Return ONLY valid JSON — no markdown fences, no extra text:\n"
+            "{\n"
+            '  "intent": "...",\n'
+            '  "description": "one sentence",\n'
+            '  "period": "YYYY-MM or null",\n'
+            '  "response_type": "newsletter|analysis|chat",\n'
+            '  "agents": [...],\n'
+            '  "reasoning": "brief explanation"\n'
+            "}"
+        )
+
+        try:
+            response = self._anthropic.messages.create(
+                model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+                max_tokens=300,
+                temperature=0.0,
+                system=system_prompt,
+                messages=[{"role": "user", "content": f"Query: {query}"}],
+            )
+            text = "".join(
+                block.text for block in response.content if hasattr(block, "text")
+            ).strip()
+
+            # Extract JSON even if there's minor surrounding text
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                plan = json.loads(match.group())
+                if "agents" in plan and "response_type" in plan:
+                    print(f"  Planner → intent={plan.get('intent')} agents={plan.get('agents')}")
+                    return plan
+        except Exception as e:
+            print(f"  Planner failed ({e}) — using full pipeline fallback")
+
+        # Fallback: full pipeline
+        return {
+            "intent":        "newsletter",
+            "description":   "Full pipeline (planner fallback)",
+            "period":        _extract_period(query),
+            "response_type": "newsletter",
+            "agents":        ["performance", "market", "weekly", "risk", "newsletter"],
+            "reasoning":     "fallback",
+        }
+
+    # ----------------------------------------------------------
+    # Flexible entry point
+    # ----------------------------------------------------------
+
+    async def run(
+        self,
+        query: str,
+        stress_test_options: dict | None = None,
+    ) -> Dict[str, Any]:
+        """
+        Flexible, intent-driven entry point.
+
+        1. Calls _plan_execution() to determine which agents are needed.
+        2. Runs only those agents, in parallel where dependencies allow.
+        3. Returns result dict with `response_type` and `plan` metadata.
+
+        stress_test_options (optional, same schema as run_parallel):
+            {"period": "2026-02", "scenario_keys": ["2022_rate_shock"]}
+        If stress_test is in the plan OR stress_test_options is provided,
+        the stress test runs automatically.
+        """
+        plan = await self._plan_execution(query)
+        agents_needed = set(plan.get("agents", []))
+        response_type = plan.get("response_type", "newsletter")
+
+        result: Dict[str, Any] = {
+            "question":      query,
+            "plan":          plan,
+            "response_type": response_type,
+            "timestamp":     datetime.now(timezone.utc).isoformat(),
+        }
+
+        # ── Group 1: independent agents (run in parallel) ──────────
+        group1: dict[str, Any] = {}
+        if "market"      in agents_needed:
+            group1["market"]      = asyncio.to_thread(self.market.analyze, query)
+        if "performance" in agents_needed:
+            group1["performance"] = asyncio.to_thread(self.performance.analyze, query)
+        if "weekly"      in agents_needed:
+            group1["weekly"]      = asyncio.to_thread(self.weekly.analyze, query)
+
+        if group1:
+            gathered = await asyncio.gather(*group1.values())
+            for key, res in zip(group1.keys(), gathered):
+                result[key] = res
+
+        # ── Group 2: risk (requires performance + market) ──────────
+        if "risk" in agents_needed:
+            risk_result = await asyncio.to_thread(
+                self.risk.analyze,
+                query,
+                result.get("market", {}).get("analysis", ""),
+                result.get("performance", {}).get("analysis", ""),
+            )
+            result["risk"] = risk_result
+
+        # ── Group 3: newsletter (requires performance + market + risk) ─
+        if "newsletter" in agents_needed:
+            newsletter_result = await asyncio.to_thread(
+                self.writer.write,
+                query,
+                result.get("market", {}).get("analysis", ""),
+                result.get("performance", {}).get("analysis", ""),
+                result.get("risk", {}).get("analysis", ""),
+                result.get("weekly", {}).get("analysis", ""),
+                result.get("performance", {}).get("pnl_summary"),
+            )
+            result["newsletter"] = newsletter_result
+
+        # ── Stress test (explicit options OR planner routed here) ───
+        run_stress = stress_test_options or ("stress_test" in agents_needed)
+        if run_stress:
+            opts = stress_test_options or {}
+            period        = opts.get("period") or plan.get("period") or _extract_period(query)
+            scenario_keys = opts.get("scenario_keys")
+            if period:
+                # Ensure we have performance + market data for the stress test
+                if "performance" not in result:
+                    result["performance"] = await asyncio.to_thread(
+                        self.performance.analyze, query
+                    )
+                if "market" not in result:
+                    result["market"] = await asyncio.to_thread(
+                        self.market.analyze, query
+                    )
+                result["stress_test"] = await asyncio.to_thread(
+                    self.risk.run_stress_test,
+                    period,
+                    query,
+                    result["market"]["analysis"],
+                    result["performance"]["analysis"],
+                    scenario_keys,
+                )
+
+        return result
+
+    # ----------------------------------------------------------
+    # Backward-compat alias
+    # ----------------------------------------------------------
 
     async def run_parallel(
         self,
@@ -1106,63 +1317,12 @@ class OrchestratorAgent:
         stress_test_options: dict | None = None,
     ) -> Dict[str, Any]:
         """
-        stress_test_options (optional):
-            {
-                "period":        "2026-02",          # required
-                "scenario_keys": ["2022_rate_shock"]  # None = auto-select
-            }
+        Legacy alias — forces the full newsletter pipeline regardless of intent.
+        Prefer run() for intent-aware routing.
         """
-        # Market, performance, and weekly run in parallel
-        market_result, perf_result, weekly_result = await asyncio.gather(
-            asyncio.to_thread(self.market.analyze, question),
-            asyncio.to_thread(self.performance.analyze, question),
-            asyncio.to_thread(self.weekly.analyze, question),
-        )
-
-        # Risk waits for market + performance
-        risk_result = await asyncio.to_thread(
-            self.risk.analyze,
-            question,
-            market_result["analysis"],
-            perf_result["analysis"],
-        )
-
-        # Newsletter waits for everything
-        writer_result = await asyncio.to_thread(
-            self.writer.write,
-            question,
-            market_result["analysis"],
-            perf_result["analysis"],
-            risk_result["analysis"],
-            weekly_result["analysis"],
-            perf_result.get("pnl_summary"),
-        )
-
-        result = {
-            "question":    question,
-            "market":      market_result,
-            "performance": perf_result,
-            "weekly":      weekly_result,
-            "risk":        risk_result,
-            "newsletter":  writer_result,
-            "timestamp":   datetime.now(timezone.utc).isoformat(),
-        }
-
-        # Optional stress test — runs after main pipeline
-        if stress_test_options:
-            period = stress_test_options.get("period")
-            scenario_keys = stress_test_options.get("scenario_keys")  # None = auto
-            if period:
-                result["stress_test"] = await asyncio.to_thread(
-                    self.risk.run_stress_test,
-                    period,
-                    question,
-                    market_result["analysis"],
-                    perf_result["analysis"],
-                    scenario_keys,
-                )
-
-        return result
+        # Override planner by injecting newsletter into the query hint
+        _q = question if "newsletter" in question.lower() else f"Write a newsletter. {question}"
+        return await self.run(_q, stress_test_options=stress_test_options)
 
     async def revise_section(
         self,
@@ -1171,27 +1331,29 @@ class OrchestratorAgent:
         current_result: dict,
     ) -> dict:
         """
-        Re-run a single section with user feedback, then cascade to newsletter.
+        Re-run a single section with user feedback.
 
         section options: "newsletter", "risk", "performance", "market"
 
-        All revisions cascade to newsletter so the final output stays coherent.
-        Other sections (weekly, market←→risk cascade) are left unchanged to
-        keep revision fast — user can do a full re-run if needed.
+        Cascades to newsletter ONLY if the current result already has one —
+        i.e. if the original query produced a newsletter. For analysis-only
+        results, revisions update the section in-place without spawning a
+        newsletter the user didn't ask for.
         """
         import copy
-        result = copy.deepcopy(current_result)
-        question = result["question"]
+        result    = copy.deepcopy(current_result)
+        question  = result["question"]
+        has_newsletter = "newsletter" in result  # only cascade if already present
 
         if section == "newsletter":
             writer_result = await asyncio.to_thread(
                 self.writer.write,
                 question,
-                result["market"]["analysis"],
-                result["performance"]["analysis"],
-                result["risk"]["analysis"],
-                result["weekly"]["analysis"],
-                result["performance"].get("pnl_summary"),
+                result.get("market", {}).get("analysis", ""),
+                result.get("performance", {}).get("analysis", ""),
+                result.get("risk", {}).get("analysis", ""),
+                result.get("weekly", {}).get("analysis", ""),
+                result.get("performance", {}).get("pnl_summary"),
                 feedback,
             )
             result["newsletter"] = writer_result
@@ -1200,22 +1362,22 @@ class OrchestratorAgent:
             risk_result = await asyncio.to_thread(
                 self.risk.analyze,
                 question,
-                result["market"]["analysis"],
-                result["performance"]["analysis"],
+                result.get("market", {}).get("analysis", ""),
+                result.get("performance", {}).get("analysis", ""),
                 feedback,
             )
             result["risk"] = risk_result
-            # cascade to newsletter
-            writer_result = await asyncio.to_thread(
-                self.writer.write,
-                question,
-                result["market"]["analysis"],
-                result["performance"]["analysis"],
-                risk_result["analysis"],
-                result["weekly"]["analysis"],
-                result["performance"].get("pnl_summary"),
-            )
-            result["newsletter"] = writer_result
+            if has_newsletter:
+                writer_result = await asyncio.to_thread(
+                    self.writer.write,
+                    question,
+                    result.get("market", {}).get("analysis", ""),
+                    result.get("performance", {}).get("analysis", ""),
+                    risk_result["analysis"],
+                    result.get("weekly", {}).get("analysis", ""),
+                    result.get("performance", {}).get("pnl_summary"),
+                )
+                result["newsletter"] = writer_result
 
         elif section == "performance":
             perf_result = await asyncio.to_thread(
@@ -1224,17 +1386,17 @@ class OrchestratorAgent:
                 feedback,
             )
             result["performance"] = perf_result
-            # cascade to newsletter
-            writer_result = await asyncio.to_thread(
-                self.writer.write,
-                question,
-                result["market"]["analysis"],
-                perf_result["analysis"],
-                result["risk"]["analysis"],
-                result["weekly"]["analysis"],
-                perf_result.get("pnl_summary"),
-            )
-            result["newsletter"] = writer_result
+            if has_newsletter:
+                writer_result = await asyncio.to_thread(
+                    self.writer.write,
+                    question,
+                    result.get("market", {}).get("analysis", ""),
+                    perf_result["analysis"],
+                    result.get("risk", {}).get("analysis", ""),
+                    result.get("weekly", {}).get("analysis", ""),
+                    perf_result.get("pnl_summary"),
+                )
+                result["newsletter"] = writer_result
 
         elif section == "market":
             market_result = await asyncio.to_thread(
@@ -1243,17 +1405,17 @@ class OrchestratorAgent:
                 feedback,
             )
             result["market"] = market_result
-            # cascade to newsletter
-            writer_result = await asyncio.to_thread(
-                self.writer.write,
-                question,
-                market_result["analysis"],
-                result["performance"]["analysis"],
-                result["risk"]["analysis"],
-                result["weekly"]["analysis"],
-                result["performance"].get("pnl_summary"),
-            )
-            result["newsletter"] = writer_result
+            if has_newsletter:
+                writer_result = await asyncio.to_thread(
+                    self.writer.write,
+                    question,
+                    market_result["analysis"],
+                    result.get("performance", {}).get("analysis", ""),
+                    result.get("risk", {}).get("analysis", ""),
+                    result.get("weekly", {}).get("analysis", ""),
+                    result.get("performance", {}).get("pnl_summary"),
+                )
+                result["newsletter"] = writer_result
 
         # track revision in result metadata
         if "revisions" not in result:
