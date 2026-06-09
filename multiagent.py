@@ -12,6 +12,8 @@ from typing import Any, Dict
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
+from helper import get_latest_opus_model
+
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from pymongo import MongoClient
 
@@ -46,14 +48,16 @@ def get_vector_store(collection_name: str, index_name: str, embedding) -> MongoD
 # ============================================================
 
 class BaseAgent:
-    def __init__(self, embedding, anthropic_client: Anthropic, context_k: int = 30):
+    def __init__(self, embedding, anthropic_client: Anthropic, context_k: int = 30, model: str = None):
         self.embedding = embedding
         self.client = anthropic_client
         self.context_k = context_k
 
-        self.model      = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
-        self.max_tokens = int(os.getenv("CLAUDE_MAX_OUTPUT_TOKENS", "2048"))
-        self.temperature = float(os.getenv("CLAUDE_TEMPERATURE", "0"))
+        # Model resolved once at system startup and passed in — avoids repeated API calls.
+        # Falls back to resolving here only if used standalone outside build_agent_system().
+        self.model = model or os.getenv("CLAUDE_MODEL") or get_latest_opus_model(anthropic_client)
+        self.max_tokens = int(os.getenv("CLAUDE_MAX_OUTPUT_TOKENS", "8192"))
+        # temperature is deprecated for Opus 4.7+ — removed
 
     def _search(self, store: MongoDBAtlasVectorSearch, query: str, k: int = 20):
         """
@@ -68,18 +72,17 @@ class BaseAgent:
         for attempt in range(4):
             try:
                 response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}],
+                    model = self.model,
+                    max_tokens = self.max_tokens,
+                    system = system_prompt,
+                    messages = [{"role": "user", "content": user_prompt}],
                 )
                 return "".join(
                     block.text for block in response.content if hasattr(block, "text")
                 ).strip()
             except Exception as e:
                 if "rate_limit" in str(e).lower() and attempt < 3:
-                    print(f"  Rate limit hit — waiting {wait}s before retry {attempt + 1}/3...")
+                    print(f"Rate limit hit — waiting {wait}s before retry {attempt + 1}/3...")
                     time.sleep(wait)
                     wait *= 2  # exponential backoff: 15 → 30 → 60s
                 else:
@@ -92,9 +95,8 @@ class BaseAgent:
         Uses the base model (haiku) to keep costs low.
         """
         response = self.client.messages.create(
-            model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+            model=os.getenv("CLAUDE_MODEL") or get_latest_opus_model(self.client),
             max_tokens=512,
-            temperature=0.0,
             system=(
                 "You are a strict editorial reviewer. "
                 "Evaluate the draft against the rubric provided. "
@@ -156,9 +158,10 @@ class MarketContextAgent(BaseAgent):
             "vector_index",
             self.embedding,
         )
-        context_model = os.getenv("CLAUDE_CONTEXT_MODEL")
-        if context_model:
-            self.model = context_model
+        # CLAUDE_CONTEXT_MODEL env var takes priority; otherwise use the model
+        # already resolved and passed in from build_agent_system().
+        if os.getenv("CLAUDE_CONTEXT_MODEL"):
+            self.model = os.getenv("CLAUDE_CONTEXT_MODEL")
 
     def _build_macro_query(self, question: str) -> str:
         """Reframe the question as a macro-focused vector search query."""
@@ -236,16 +239,16 @@ Address this feedback in your revised response. Keep everything that was correct
 # ============================================================
 
 _MONTH_MAP = {
-    "january": "01",  "jan": "01",
+    "january": "01", "jan": "01",
     "february": "02", "feb": "02",
-    "march": "03",    "mar": "03",
-    "april": "04",    "apr": "04",
+    "march": "03", "mar": "03",
+    "april": "04", "apr": "04",
     "may": "05",
-    "june": "06",     "jun": "06",
-    "july": "07",     "jul": "07",
-    "august": "08",   "aug": "08",
+    "june": "06", "jun": "06",
+    "july": "07", "jul": "07",
+    "august": "08", "aug": "08",
     "september": "09","sep": "09",  "sept": "09",
-    "october": "10",  "oct": "10",
+    "october": "10", "oct": "10",
     "november": "11", "nov": "11",
     "december": "12", "dec": "12",
 }
@@ -291,8 +294,8 @@ class PortfolioPerformanceAgent(BaseAgent):
         skip = {"report_period", "source_file", "uploaded_by", "uploaded_at", "_id"}
         cols = [k for k in rows[0].keys() if k not in skip]
         header = "| " + " | ".join(cols) + " |"
-        sep    = "| " + " | ".join("---" for _ in cols) + " |"
-        lines  = [header, sep]
+        sep = "| " + " | ".join("---" for _ in cols) + " |"
+        lines = [header, sep]
         for row in rows:
             lines.append("| " + " | ".join(str(row.get(c, "")) for c in cols) + " |")
         return "\n".join(lines)
@@ -406,20 +409,22 @@ class WeeklyMarketDataAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.weekly_store = get_vector_store(
-            "weekly_vectors",
+            "daily_vectors",
             "vector_index",
             self.embedding,
         )
 
     def analyze(self, question: str) -> Dict[str, Any]:
-        search_query = f"{question} 2026 weekly market data"
+        search_query = f"{question} daily market data"
         docs = self._search(self.weekly_store, search_query, k=self.context_k)
 
         system_prompt = (
             "You are a market data analyst for a hedge fund. "
-            "Summarize the key weekly trends in the data, focusing on: (1) significant moves in rates, "
+            "Summarize the key daily market trends in the data, focusing on: (1) significant moves in rates, "
             "FX, equities, and commodities, (2) inflection points or trend breaks, and (3) how the "
-            "week's data fits into the broader macro narrative. "
+            "daily data fits into the broader macro narrative. "
+            "Pay particular attention to month-end movements, as end-of-month prints can have an "
+            "outsized effect on portfolio valuations. "
             "Connect data points to each other — e.g. how a rates move influenced FX or equity positioning. "
             "Strictly use only the provided context."
         )
@@ -427,7 +432,7 @@ class WeeklyMarketDataAgent(BaseAgent):
         user_prompt = f"""
 Question: {question}
 
-Weekly Market Data:
+Daily Market Data:
 {''.join(doc.page_content for doc in docs[:20])}
 """
 
@@ -481,31 +486,31 @@ class RiskAnalystAgent(BaseAgent):
 
         # ── detect column names (they include the month, e.g. trading_notes_feb_2026)
         sample = rows[0]
-        pnl_col    = next((k for k in sample if "p_l" in k or "pnl" in k.replace("_","")), None)
-        beg_col    = next((k for k in sample if "beginning" in k), None)
-        end_col    = next((k for k in sample if "ending" in k), None)
-        type_col   = next((k for k in sample if "position_type" in k or k == "type"), None)
-        class_col  = next((k for k in sample if "asset_class" in k or k == "class"), None)
-        pos_col    = next((k for k in sample if k == "positions"), None)
+        pnl_col = next((k for k in sample if "p_l" in k or "pnl" in k.replace("_","")), None)
+        beg_col = next((k for k in sample if "beginning" in k), None)
+        end_col = next((k for k in sample if "ending" in k), None)
+        type_col = next((k for k in sample if "position_type" in k or k == "type"), None)
+        class_col = next((k for k in sample if "asset_class" in k or k == "class"), None)
+        pos_col = next((k for k in sample if k == "positions"), None)
 
         # ── P&L by asset class
         theme_map = {
-            "rate":      "Rates & Duration",
-            "rates":     "Rates & Duration",
-            "equity":    "Equities",
-            "fx":        "Foreign Exchange",
+            "rate": "Rates & Duration",
+            "rates": "Rates & Duration",
+            "equity": "Equities",
+            "fx": "Foreign Exchange",
             "commodity": "Commodities",
-            "crypto":    "Digital Assets",
-            "":          "Other",
+            "crypto": "Digital Assets",
+            "": "Other",
         }
         theme_pnl: dict[str, float] = {}
         position_pnls: list[tuple[str, str, float]] = []  # (name, theme, pnl)
 
         for row in rows:
             raw_class = str(row.get(class_col, "") or "").strip().lower()
-            theme     = theme_map.get(raw_class, "Other")
-            pnl_val   = self._parse_val(row.get(pnl_col)) if pnl_col else None
-            pos_name  = str(row.get(pos_col, "Unknown") or "Unknown").strip()
+            theme = theme_map.get(raw_class, "Other")
+            pnl_val = self._parse_val(row.get(pnl_col)) if pnl_col else None
+            pos_name = str(row.get(pos_col, "Unknown") or "Unknown").strip()
 
             if pnl_val is not None:
                 theme_pnl[theme] = theme_pnl.get(theme, 0.0) + pnl_val
@@ -518,17 +523,17 @@ class RiskAnalystAgent(BaseAgent):
         # Long end 10y+:  20yr TIPS, 20yr swap spreads, JGB 30y
         _BUCKET_KEYWORDS = {
             "front_end": ["sofr", "nzd", "ff futures", "muni", "front end", "green pack"],
-            "belly":     ["ty", "gilt", "swaption", "jgb 10"],
-            "long_end":  ["tips", "20yr", "20y", "jgb 30", "swap spread"],
+            "belly": ["ty", "gilt", "swaption", "jgb 10"],
+            "long_end": ["tips", "20yr", "20y", "jgb 30", "swap spread"],
         }
 
-        dv01_beg   = 0.0
-        dv01_end   = 0.0
-        dv01_gross = 0.0                          # sum of |DV01| — risk magnitude
-        dv01_buckets: dict[str, float] = {        # ending DV01 by curve bucket
+        dv01_beg = 0.0
+        dv01_end = 0.0
+        dv01_gross = 0.0 # sum of |DV01| — risk magnitude
+        dv01_buckets: dict[str, float] = {# ending DV01 by curve bucket
             "front_end": 0.0, "belly": 0.0, "long_end": 0.0, "unclassified": 0.0
         }
-        dv01_options = 0.0                        # delta-DV01 from options/swaptions
+        dv01_options = 0.0 # delta-DV01 from options/swaptions
 
         if beg_col and end_col and type_col:
             for row in rows:
@@ -571,7 +576,7 @@ class RiskAnalystAgent(BaseAgent):
         # ── Top contributors / detractors
         position_pnls.sort(key=lambda x: x[2], reverse=True)
         contributors = position_pnls[:3]
-        detractors   = position_pnls[-3:][::-1]
+        detractors = position_pnls[-3:][::-1]
 
         # ── Format output
         lines = [f"PORTFOLIO RISK METRICS — {period}", ""]
@@ -592,26 +597,26 @@ class RiskAnalystAgent(BaseAgent):
         # Section 2: Rates DV01
         if dv01_end:
             lines.append("── RATES DV01 EXPOSURE ──")
-            lines.append(f"  Net DV01  (directional, all same sign = all long):  ${dv01_end:>12,.0f}")
-            lines.append(f"  Gross DV01 (risk magnitude, sum of |DV01|):         ${dv01_gross:>12,.0f}")
+            lines.append(f"Net DV01  (directional, all same sign = all long):  ${dv01_end:>12,.0f}")
+            lines.append(f"Gross DV01 (risk magnitude, sum of |DV01|):         ${dv01_gross:>12,.0f}")
             net_change = dv01_end - dv01_beg
-            lines.append(f"  Change vs period start:                             ${net_change:>+12,.0f}")
+            lines.append(f"Change vs period start:                             ${net_change:>+12,.0f}")
             lines.append("")
-            lines.append("  Curve bucket breakdown (ending DV01):")
+            lines.append("Curve bucket breakdown (ending DV01):")
             bucket_labels = {
-                "front_end":     "Front end 0–2y  (SOFR, NZD, FF)",
-                "belly":         "Belly 2–10y     (TY, Gilts, Swaptions)",
-                "long_end":      "Long end 10y+   (TIPS, Swap Spreads, JGB)",
-                "unclassified":  "Unclassified",
+                "front_end": "Front end 0–2y  (SOFR, NZD, FF)",
+                "belly": "Belly 2–10y TY, Gilts, Swaptions)",
+                "long_end": "Long end 10y+ (TIPS, Swap Spreads, JGB)",
+                "unclassified": "Unclassified",
             }
             for bkt, label in bucket_labels.items():
                 val = dv01_buckets[bkt]
                 if val:
-                    lines.append(f"    {label:<42} ${val:>12,.0f}")
+                    lines.append(f"{label:<42} ${val:>12,.0f}")
             if dv01_options:
                 lines.append("")
-                lines.append(f"  ⚑ Of which delta-DV01 from options/swaptions:     ${dv01_options:>12,.0f}")
-                lines.append(f"    (delta-DV01 only — vega exposure requires vol surface data not shown here)")
+                lines.append(f"Of which delta-DV01 from options/swaptions: ${dv01_options:>12,.0f}")
+                lines.append(f"(delta-DV01 only — vega exposure requires vol surface data not shown here)")
             lines.append("")
 
         # Section 3: Notional concentration
@@ -620,28 +625,28 @@ class RiskAnalystAgent(BaseAgent):
             if top_longs:
                 lines.append("  Top longs:")
                 for name, val in top_longs:
-                    lines.append(f"    {name:<35} ${val:>14,.0f}")
+                    lines.append(f"{name:<35} ${val:>14,.0f}")
             if top_shorts:
-                lines.append("  Top shorts:")
+                lines.append("Top shorts:")
                 for name, val in top_shorts:
-                    lines.append(f"    {name:<35} ${val:>14,.0f}")
+                    lines.append(f"{name:<35} ${val:>14,.0f}")
             lines.append("")
 
         # Section 4: Contributors / detractors
         lines.append("── TOP P&L CONTRIBUTORS ──")
         for name, theme, val in contributors:
-            lines.append(f"  {name:<35} ${val:>+14,.0f}  ({theme})")
+            lines.append(f"{name:<35} ${val:>+14,.0f}  ({theme})")
         lines.append("")
         lines.append("── TOP P&L DETRACTORS ──")
         for name, theme, val in detractors:
-            lines.append(f"  {name:<35} ${val:>+14,.0f}  ({theme})")
+            lines.append(f"{name:<35} ${val:>+14,.0f}  ({theme})")
         lines.append("")
 
         # Section 5: Concentration flag
         top3_pnl = sum(abs(p[2]) for p in contributors)
         concentration_pct = top3_pnl / total_pnl_abs * 100 if total_pnl_abs else 0
         lines.append(f"── CONCENTRATION ──")
-        lines.append(f"  Top 3 positions account for {concentration_pct:.0f}% of gross P&L")
+        lines.append(f"Top 3 positions account for {concentration_pct:.0f}% of gross P&L")
 
         return "\n".join(lines)
 
@@ -655,7 +660,7 @@ class RiskAnalystAgent(BaseAgent):
         if not rows:
             return []
         sample = rows[0]
-        pnl_col   = next((k for k in sample if "p_l" in k or "pnl" in k.replace("_", "")), None)
+        pnl_col = next((k for k in sample if "p_l" in k or "pnl" in k.replace("_", "")), None)
         class_col = next((k for k in sample if "asset_class" in k or k == "class"), None)
         theme_map = {
             "rate": "Rates & Duration", "rates": "Rates & Duration",
@@ -673,26 +678,26 @@ class RiskAnalystAgent(BaseAgent):
 
     # Ticker substrings → which scenario move field to use
     _TICKER_MOVE_MAP = {
-        "CNH":   "usdcnh_pct",
-        "HKD":   "usd_dxy_pct",
-        "CHF":   "chfjpy_pct",
-        "JPY":   "chfjpy_pct",
+        "CNH": "usdcnh_pct",
+        "HKD": "usd_dxy_pct",
+        "CHF": "chfjpy_pct",
+        "JPY": "chfjpy_pct",
         "EURGBP": "usd_dxy_pct",
-        "PLJ":   "platinum_pct",   # platinum futures
-        "GDX":   "gold_pct",       # gold miners
-        "CCJ":   "commodities_pct",
-        "HGA":   "commodities_pct",  # copper
-        "IBIT":  "crypto_pct",
-        "ES":    "equities_pct",
-        "DEDZ":  "equities_pct",
+        "PLJ": "platinum_pct",   # platinum futures
+        "GDX": "gold_pct",       # gold miners
+        "CCJ": "commodities_pct",
+        "HGA": "commodities_pct",  # copper
+        "IBIT": "crypto_pct",
+        "ES": "equities_pct",
+        "DEDZ": "equities_pct",
     }
     _CLASS_MOVE_MAP = {
-        "rate":      "us_10y_bps",
-        "rates":     "us_10y_bps",
-        "equity":    "equities_pct",
-        "fx":        "usd_dxy_pct",
+        "rate": "us_10y_bps",
+        "rates": "us_10y_bps",
+        "equity": "equities_pct",
+        "fx": "usd_dxy_pct",
         "commodity": "commodities_pct",
-        "crypto":    "crypto_pct",
+        "crypto": "crypto_pct",
     }
 
     def _compute_scenario_impacts(
@@ -703,22 +708,22 @@ class RiskAnalystAgent(BaseAgent):
         Returns a dict with position_impacts list and net_impact float.
         """
         sample = rows[0]
-        end_col   = next((k for k in sample if "ending" in k), None)
-        type_col  = next((k for k in sample if "position_type" in k or k == "type"), None)
+        end_col = next((k for k in sample if "ending" in k), None)
+        type_col = next((k for k in sample if "position_type" in k or k == "type"), None)
         class_col = next((k for k in sample if "asset_class" in k or k == "class"), None)
-        pos_col   = next((k for k in sample if k == "positions"), None)
-        tick_col  = next((k for k in sample if "ticker" in k), None)
+        pos_col = next((k for k in sample if k == "positions"), None)
+        tick_col = next((k for k in sample if "ticker" in k), None)
 
         moves = scenario["market_moves"]
         position_impacts = []
         net_impact = 0.0
 
         for row in rows:
-            pos_name    = str(row.get(pos_col, "?") or "?").strip()
+            pos_name = str(row.get(pos_col, "?") or "?").strip()
             asset_class = str(row.get(class_col, "") or "").strip().lower()
-            pos_type    = str(row.get(type_col, "") or "").strip().upper()
-            ticker      = str(row.get(tick_col, "") or "").strip().upper()
-            exposure    = self._parse_val(row.get(end_col)) if end_col else None
+            pos_type = str(row.get(type_col, "") or "").strip().upper()
+            ticker = str(row.get(tick_col, "") or "").strip().upper()
+            exposure = self._parse_val(row.get(end_col)) if end_col else None
 
             if exposure is None or exposure == 0:
                 continue
@@ -753,18 +758,18 @@ class RiskAnalystAgent(BaseAgent):
 
             if impact is not None:
                 position_impacts.append({
-                    "position":     pos_name,
-                    "exposure":     exposure_str,
-                    "move":         move_str,
-                    "impact":       impact,
+                    "position": pos_name,
+                    "exposure": exposure_str,
+                    "move": move_str,
+                    "impact": impact,
                 })
                 net_impact += impact
 
         position_impacts.sort(key=lambda x: abs(x["impact"]), reverse=True)
         return {
-            "scenario":          scenario,
-            "position_impacts":  position_impacts,
-            "net_impact":        net_impact,
+            "scenario": scenario,
+            "position_impacts": position_impacts,
+            "net_impact": net_impact,
         }
 
     @staticmethod
@@ -776,7 +781,7 @@ class RiskAnalystAgent(BaseAgent):
 
         lines = [
             f"SCENARIO: {s['name']}  ({s['period']})",
-            f"Context:  {s['context']}",
+            f"Context: {s['context']}",
             "",
             f"{'Position':<38} {'Exposure':>18}  {'Move':>8}  {'Est. P&L Impact':>16}",
             "-" * 84,
@@ -837,7 +842,7 @@ class RiskAnalystAgent(BaseAgent):
 
         # Compute dollar impacts for each scenario
         impact_results = [self._compute_scenario_impacts(rows, s) for s in scenarios]
-        tables_block   = "\n\n".join(self._format_impact_table(r) for r in impact_results)
+        tables_block = "\n\n".join(self._format_impact_table(r) for r in impact_results)
         scenario_block = "\n\n".join(format_scenario_for_prompt(s) for s in scenarios)
 
         system_prompt = (
@@ -897,12 +902,12 @@ Write the stress test interpretation (400–600 words).
         narrative = self._call_claude(system_prompt, user_prompt)
 
         return {
-            "agent":           "StressTest",
-            "tables":          tables_block,
-            "narrative":       narrative,
-            "scenarios_used":  [s["name"] for s in scenarios],
-            "period":          period,
-            "timestamp":       datetime.now(timezone.utc).isoformat(),
+            "agent": "StressTest",
+            "tables": tables_block,
+            "narrative": narrative,
+            "scenarios_used": [s["name"] for s in scenarios],
+            "period": period,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     # ----------------------------------------------------------
@@ -1046,7 +1051,7 @@ Question: {question}
 Market Context:
 {market_context}
 
-Weekly Market Data:
+Daily Market Data:
 {weekly_market_data}
 
 Portfolio Performance:
@@ -1092,14 +1097,17 @@ Address this feedback in your revised response. Keep everything that was correct
 # ============================================================
 
 class OrchestratorAgent:
-    def __init__(self, embedding, anthropic_client: Anthropic, context_k: int = 30):
-        # base_dir removed — no longer needed without local FAISS files
-        self.market      = MarketContextAgent(embedding, anthropic_client, context_k)
-        self.performance = PortfolioPerformanceAgent(embedding, anthropic_client, context_k)
-        self.weekly      = WeeklyMarketDataAgent(embedding, anthropic_client, context_k)
-        self.risk        = RiskAnalystAgent(embedding, anthropic_client, context_k)
-        self.writer      = NewsletterWriterAgent(embedding, anthropic_client, context_k)
-        self._anthropic  = anthropic_client
+    def __init__(self, embedding, anthropic_client: Anthropic, context_k: int = 30, model: str = None):
+        # Resolve model once here — passed to all agents so they don't each call the API
+        self._model = model or os.getenv("CLAUDE_MODEL") or get_latest_opus_model(anthropic_client)
+        self._anthropic = anthropic_client
+        print(f"  [Orchestrator] Using model: {self._model}")
+
+        self.market = MarketContextAgent(embedding, anthropic_client, context_k, model=self._model)
+        self.performance = PortfolioPerformanceAgent(embedding, anthropic_client, context_k, model=self._model)
+        self.weekly = WeeklyMarketDataAgent(embedding, anthropic_client, context_k, model=self._model)
+        self.risk = RiskAnalystAgent(embedding, anthropic_client, context_k, model=self._model)
+        self.writer = NewsletterWriterAgent(embedding, anthropic_client, context_k, model=self._model)
 
     # ----------------------------------------------------------
     # Planner: lightweight intent classification
@@ -1146,12 +1154,12 @@ class OrchestratorAgent:
             "You are a routing agent for a portfolio analysis system. "
             "Given a user query, determine exactly what they want and which agents to run.\n\n"
             "Available agents:\n"
-            "  performance  — portfolio P&L, returns, attribution for a specific period\n"
-            "  market       — macro market context (rates, FX, equities, central banks)\n"
-            "  weekly       — weekly market data trends\n"
-            "  risk         — risk analysis with DV01, notional, concentration (needs performance + market)\n"
-            "  newsletter   — full investor letter (needs performance + market + risk)\n"
-            "  stress_test  — scenario stress test (needs performance + market)\n\n"
+            "performance  — portfolio P&L, returns, attribution for a specific period\n"
+            "market — macro market context (rates, FX, equities, central banks)\n"
+            "weekly — weekly market data trends\n"
+            "risk — risk analysis with DV01, notional, concentration (needs performance + market)\n"
+            "newsletter — full investor letter (needs performance + market + risk)\n"
+            "stress_test — scenario stress test (needs performance + market)\n\n"
             f"Available data periods: {periods_str}\n\n"
             "Intent → agent mapping (use EXACTLY these agent lists):\n"
             "  newsletter       → [performance, market, weekly, risk, newsletter]\n"
@@ -1181,9 +1189,8 @@ class OrchestratorAgent:
 
         try:
             response = self._anthropic.messages.create(
-                model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+                model=os.getenv("CLAUDE_MODEL") or get_latest_opus_model(self._anthropic),
                 max_tokens=300,
-                temperature=0.0,
                 system=system_prompt,
                 messages=[{"role": "user", "content": f"Query: {query}"}],
             )
@@ -1203,12 +1210,12 @@ class OrchestratorAgent:
 
         # Fallback: full pipeline
         return {
-            "intent":        "newsletter",
-            "description":   "Full pipeline (planner fallback)",
-            "period":        _extract_period(query),
+            "intent": "newsletter",
+            "description": "Full pipeline (planner fallback)",
+            "period": _extract_period(query),
             "response_type": "newsletter",
-            "agents":        ["performance", "market", "weekly", "risk", "newsletter"],
-            "reasoning":     "fallback",
+            "agents": ["performance", "market", "weekly", "risk", "newsletter"],
+            "reasoning": "fallback",
         }
 
     # ----------------------------------------------------------
@@ -1237,20 +1244,20 @@ class OrchestratorAgent:
         response_type = plan.get("response_type", "newsletter")
 
         result: Dict[str, Any] = {
-            "question":      query,
-            "plan":          plan,
+            "question": query,
+            "plan": plan,
             "response_type": response_type,
-            "timestamp":     datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         # ── Group 1: independent agents (run in parallel) ──────────
         group1: dict[str, Any] = {}
-        if "market"      in agents_needed:
-            group1["market"]      = asyncio.to_thread(self.market.analyze, query)
+        if "market" in agents_needed:
+            group1["market"] = asyncio.to_thread(self.market.analyze, query)
         if "performance" in agents_needed:
             group1["performance"] = asyncio.to_thread(self.performance.analyze, query)
-        if "weekly"      in agents_needed:
-            group1["weekly"]      = asyncio.to_thread(self.weekly.analyze, query)
+        if "weekly" in agents_needed:
+            group1["weekly"] = asyncio.to_thread(self.weekly.analyze, query)
 
         if group1:
             gathered = await asyncio.gather(*group1.values())
@@ -1284,7 +1291,7 @@ class OrchestratorAgent:
         run_stress = stress_test_options or ("stress_test" in agents_needed)
         if run_stress:
             opts = stress_test_options or {}
-            period        = opts.get("period") or plan.get("period") or _extract_period(query)
+            period = opts.get("period") or plan.get("period") or _extract_period(query)
             scenario_keys = opts.get("scenario_keys")
             if period:
                 # Ensure we have performance + market data for the stress test
@@ -1341,8 +1348,8 @@ class OrchestratorAgent:
         newsletter the user didn't ask for.
         """
         import copy
-        result    = copy.deepcopy(current_result)
-        question  = result["question"]
+        result = copy.deepcopy(current_result)
+        question = result["question"]
         has_newsletter = "newsletter" in result  # only cascade if already present
 
         if section == "newsletter":
@@ -1421,8 +1428,8 @@ class OrchestratorAgent:
         if "revisions" not in result:
             result["revisions"] = []
         result["revisions"].append({
-            "section":   section,
-            "feedback":  feedback,
+            "section": section,
+            "feedback": feedback,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -1453,19 +1460,8 @@ def build_agent_system() -> OrchestratorAgent:
 
     anthropic_client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
 
-    return OrchestratorAgent(embedding, anthropic_client)
+    # Resolve model once at startup — all agents share this single resolved value
+    model = os.getenv("CLAUDE_MODEL") or get_latest_opus_model(anthropic_client)
 
+    return OrchestratorAgent(embedding, anthropic_client, model=model)
 
-# # ============================================================
-# # Entry Point
-# # ============================================================
-
-# if __name__ == "__main__":
-#     orchestrator = build_agent_system()
-
-#     question = "Analyze October 2025 portfolio performance and produce a newsletter."
-
-#     result = asyncio.run(orchestrator.run_parallel(question))
-
-#     print("\nNEWSLETTER\n")
-#     print(result["newsletter"]["newsletter"])

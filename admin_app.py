@@ -377,11 +377,12 @@ with tab1:
         key="upload_mode",
     )
 
-    # PnL: show period preview + override field before indexing
+    # PnL: show period preview + override fields before indexing
     if store_type == "pnl" and uploaded_files:
         from build import _extract_report_period
         st.markdown("**Confirm reporting periods:**")
         period_overrides = {}
+        aum_overrides = {}  # {filename: {"start": float|None, "end": float|None}}
         for uf in uploaded_files:
             detected = _extract_report_period(uf.name)
             override = st.text_input(
@@ -391,6 +392,34 @@ with tab1:
                 key=f"period_{uf.name}",
             )
             period_overrides[uf.name] = override.strip()
+
+            # Manual AUM override — shown collapsed by default, use for files
+            # that have no AUM summary row (e.g. older 2025 files)
+            with st.expander(f"AUM override for {uf.name} (optional)", expanded=False):
+                st.caption(
+                    "Leave blank to use values parsed from the file. "
+                    "Fill in both fields if the file has no AUM summary row, "
+                    "or to correct a wrong parsed value."
+                )
+                col_s, col_e = st.columns(2)
+                with col_s:
+                    start_val = st.text_input(
+                        "Start AUM ($)",
+                        value="",
+                        placeholder="e.g. 160000000",
+                        key=f"start_aum_{uf.name}",
+                    )
+                with col_e:
+                    end_val = st.text_input(
+                        "End AUM ($)",
+                        value="",
+                        placeholder="e.g. 155000000",
+                        key=f"end_aum_{uf.name}",
+                    )
+                aum_overrides[uf.name] = {
+                    "start": float(start_val.replace(",", "").replace("$", "")) if start_val.strip() else None,
+                    "end":   float(end_val.replace(",", "").replace("$", ""))   if end_val.strip()   else None,
+                }
 
     if uploaded_files and st.button("Index Document", key="btn_upload"):
 
@@ -409,11 +438,14 @@ with tab1:
                             if deleted:
                                 st.write(f"Removed {deleted} existing rows for period `{confirmed_period}`")
 
+                        aum_ov = aum_overrides.get(uploaded_file.name, {})
                         n = ingest_pnl_structured(
                             temp_path,
                             report_period=confirmed_period,
                             source_name=uploaded_file.name,
                             uploaded_by=st.session_state.username,
+                            start_aum_override=aum_ov.get("start"),
+                            end_aum_override=aum_ov.get("end"),
                         )
                         if n:
                             st.success(f"`{uploaded_file.name}` — {n} rows stored as period `{confirmed_period}`")
@@ -823,3 +855,83 @@ with tab8:
                 st.success(f"Deleted {count} rows for period `{del_period_input}`.")
         else:
             st.warning("Enter a period in YYYY-MM format.")
+
+    st.divider()
+    st.markdown("**Repair / Set AUM Summary**")
+    st.markdown(
+        "Directly write a `pnl_summary` document for any period without re-uploading the file. "
+        "Use this for older files that have no AUM row, or to correct a wrong value."
+    )
+
+    col_rp, col_sa, col_ea = st.columns(3)
+    with col_rp:
+        repair_period = st.text_input(
+            "Period (YYYY-MM)",
+            placeholder="e.g. 2025-07",
+            key="repair_period",
+        )
+    with col_sa:
+        repair_start = st.text_input(
+            "Start AUM ($)",
+            placeholder="e.g. 160000000",
+            key="repair_start_aum",
+        )
+    with col_ea:
+        repair_end = st.text_input(
+            "End AUM ($)",
+            placeholder="e.g. 155000000",
+            key="repair_end_aum",
+        )
+
+    if st.button("Write AUM Summary", key="btn_repair_aum"):
+        errors = []
+        if not repair_period.strip():
+            errors.append("Period is required.")
+        if not repair_start.strip():
+            errors.append("Start AUM is required.")
+        if not repair_end.strip():
+            errors.append("End AUM is required.")
+
+        if errors:
+            for e in errors:
+                st.warning(e)
+        else:
+            try:
+                start_f = float(repair_start.replace(",", "").replace("$", ""))
+                end_f   = float(repair_end.replace(",", "").replace("$", ""))
+                period  = repair_period.strip()
+
+                # Check the period exists in pnl_table first
+                pnl_col = get_collection("pnl_table")
+                if pnl_col.count_documents({"report_period": period}) == 0:
+                    st.warning(f"No rows found in pnl_table for `{period}`. Make sure the PnL file is uploaded first.")
+                else:
+                    return_pct = round((end_f - start_f) / start_f * 100, 4) if start_f > 0 else None
+
+                    # Also pull total_pnl from existing pnl_summary if available
+                    existing_summary = get_collection("pnl_summary").find_one({"report_period": period}, {"_id": 0})
+                    total_pnl = (existing_summary or {}).get("total_pnl")
+
+                    from datetime import datetime, timezone
+                    doc = {
+                        "report_period": period,
+                        "start_aum":     start_f,
+                        "end_aum":       end_f,
+                        "return_pct":    return_pct,
+                        "repaired_by":   st.session_state.username,
+                        "repaired_at":   datetime.now(timezone.utc).isoformat(),
+                    }
+                    if total_pnl is not None:
+                        doc["total_pnl"] = total_pnl
+
+                    summary_col = get_collection("pnl_summary")
+                    summary_col.delete_many({"report_period": period})
+                    summary_col.insert_one(doc)
+
+                    ret_str = f"{return_pct:+.4f}%" if return_pct is not None else "n/a"
+                    st.success(
+                        f"AUM summary written for `{period}` — "
+                        f"start=${start_f:,.0f} · end=${end_f:,.0f} · return={ret_str}"
+                    )
+            except ValueError:
+                st.error("Start AUM and End AUM must be valid numbers.")

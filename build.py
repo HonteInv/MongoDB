@@ -11,7 +11,6 @@ Functions:
     collection_stats()        — document counts and storage info
     verify_embeddings()       — confirm embedding dimensions are correct
     reindex_source()          — delete + re-ingest a source file (update flow)
-
     ingest_pnl_structured()   — parse a PnL file into structured row documents (pnl_table)
     delete_pnl_period()       — delete all rows for a PnL reporting period
     list_pnl_periods()        — list all PnL periods in pnl_table
@@ -84,9 +83,9 @@ COLLECTIONS = {
 BASE_DIR = Path(__file__).resolve().parent
 
 FOLDER_MAP = {
-    "context":            BASE_DIR / "data" / "context",
-    "pnl":                BASE_DIR / "data" / "pnl",
-    "newsletter":         BASE_DIR / "data" / "newsletters",
+    "context": BASE_DIR / "data" / "context",
+    "pnl": BASE_DIR / "data" / "pnl",
+    "newsletter": BASE_DIR / "data" / "newsletters",
     "weekly_market_data": BASE_DIR / "data" / "weekly_market_data",
 }
 
@@ -94,27 +93,15 @@ FOLDER_MAP = {
 # Excel Serial Date Conversion
 # ============================================================
 
-# Excel stores dates as days since Dec 30, 1899 (accounts for the
-# intentional Feb 29 1900 bug). When CSVs are exported with columns
-# formatted as General/Number instead of Date, the raw integer leaks
-# into the file instead of a human-readable date string.
-#
-# Valid range: 40000–60000 covers roughly 2009–2064. We use this as
-# a safe heuristic — financial notional values are far larger, and
-# index/ratio values have decimals, so 5-digit integers in this band
-# are almost certainly Excel dates in a PnL context.
+# Excel stores dates as days since Dec 30, 1899. When CSVs are exported with columns
+# formatted as General/Number instead of Date, the raw integer used instead of human-readable date string.
 
 _EXCEL_EPOCH = datetime(1899, 12, 30)
-# Exclude matches preceded or followed by a digit or decimal point.
-# This prevents false positives on decimal values like 51850.69071 or 26120.51579,
-# where the integer part or fractional part falls in the Excel date serial range.
 _EXCEL_DATE_RE = re.compile(r"(?<![.\d])(4[0-9]{4}|5[0-9]{4})(?![.\d])")
-
 
 def _excel_serial_to_date(serial: int) -> str:
     """Convert an Excel date serial number to an ISO date string (YYYY-MM-DD)."""
     return (_EXCEL_EPOCH + timedelta(days=serial)).strftime("%Y-%m-%d")
-
 
 def convert_excel_dates(text: str) -> str:
     """
@@ -153,14 +140,14 @@ def load_folder(folder: Path) -> list[Document]:
     files = [f for f in folder.rglob("*") if f.suffix.lower() in supported]
 
     if not files:
-        print(f"  No supported files found in {folder}")
+        print(f"No supported files found in {folder}")
         return []
 
     for file in files:
         try:
             loaded = load_file(file)
             docs.extend(loaded)
-            print(f"  Loaded: {file.name} ({len(loaded)} pages)")
+            print(f"Loaded: {file.name} ({len(loaded)} pages)")
         except Exception as e:
             print(f"  Failed: {file.name} — {e}")
 
@@ -205,7 +192,7 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
 
     # Get list of sources already in the collection to avoid duplicates
     existing = set(list_sources(collection_name, silent=True))
-    print(f"  Already indexed: {len(existing)} source files")
+    print(f"Already indexed: {len(existing)} source files")
 
     docs = load_folder(folder)
     if not docs:
@@ -215,10 +202,10 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
     new_docs = [d for d in docs if d.metadata.get("source", "") not in existing]
 
     if not new_docs:
-        print("  All files already indexed. Nothing to add.")
+        print("All files already indexed. Nothing to add.")
         return
 
-    print(f"  New documents to index: {len(new_docs)}")
+    print(f"New documents to index: {len(new_docs)}")
 
     if category == "context":
         # Larger chunks for prose documents; add period metadata + source prefix
@@ -233,7 +220,7 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
     else:
         chunks = chunk_documents(new_docs, chunk_size, chunk_overlap, fix_dates=(category == "pnl"))
 
-    print(f"  Chunks to embed: {len(chunks)}")
+    print(f"Chunks to embed: {len(chunks)}")
 
     MongoDBAtlasVectorSearch.from_documents(
         documents=chunks,
@@ -242,7 +229,7 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
         index_name=index_name,
     )
 
-    print(f"  Done → {collection_name} (+{len(chunks)} chunks)")
+    print(f"Done: {collection_name} (+{len(chunks)} chunks)")
 
 
 # ============================================================
@@ -271,12 +258,12 @@ def ingest_file(file_path: str | Path, category: str, chunk_size=1000, chunk_ove
     # Check if already indexed
     existing = list_sources(collection_name, silent=True)
     if str(path) in existing or path.name in existing:
-        print(f"  Already indexed. Use reindex_source() to update it.")
+        print(f"Already indexed. Use reindex_source() to update it.")
         return
 
     docs = load_file(path)
     if not docs:
-        print("  No content loaded.")
+        print("No content loaded.")
         return
 
     if category == "context":
@@ -290,7 +277,7 @@ def ingest_file(file_path: str | Path, category: str, chunk_size=1000, chunk_ove
     else:
         chunks = chunk_documents(docs, chunk_size, chunk_overlap, fix_dates=(category == "pnl"))
 
-    print(f"  {len(chunks)} chunks to embed...")
+    print(f"{len(chunks)} chunks to embed...")
 
     MongoDBAtlasVectorSearch.from_documents(
         documents=chunks,
@@ -299,7 +286,7 @@ def ingest_file(file_path: str | Path, category: str, chunk_size=1000, chunk_ove
         index_name=index_name,
     )
 
-    print(f"  Done → {collection_name} (+{len(chunks)} chunks)")
+    print(f"Done, {collection_name} (+{len(chunks)} chunks)")
 
 
 # ============================================================
@@ -339,14 +326,14 @@ def delete_by_source(source_filename: str, collection_name: str, dry_run=False):
         print(f"  No documents found matching '{source_filename}' in {collection_name}")
         return 0
 
-    print(f"  Found {count} chunks matching '{source_filename}' in {collection_name}")
+    print(f"Found {count} chunks matching '{source_filename}' in {collection_name}")
 
     if dry_run:
-        print(f"  DRY RUN — nothing deleted. Remove dry_run=True to delete.")
+        print(f"Test — nothing deleted. Remove dry_run=True to delete.")
         return count
 
     result = collection.delete_many(query)
-    print(f"  Deleted {result.deleted_count} chunks from {collection_name}")
+    print(f"Deleted {result.deleted_count} chunks from {collection_name}")
     return result.deleted_count
 
 
@@ -363,13 +350,13 @@ def delete_collection(collection_name: str, confirm=False):
         delete_collection("context_vectors", confirm=True)
     """
     if not confirm:
-        print(f"  Safety check: pass confirm=True to wipe {collection_name}")
+        print(f"Safety check: pass confirm=True to wipe {collection_name}")
         return
 
     collection = get_collection(collection_name)
     count_before = collection.count_documents({})
     collection.delete_many({})
-    print(f"  Deleted all {count_before} documents from {collection_name}")
+    print(f"Deleted all {count_before} documents from {collection_name}")
 
 
 # ============================================================
@@ -408,13 +395,13 @@ def deduplicate(collection_name: str, dry_run=False):
             seen_hashes[text_hash] = doc["_id"]
 
     if not duplicate_ids:
-        print(f"  No duplicates found in {collection_name}")
+        print(f"No duplicates found in {collection_name}")
         return 0
 
-    print(f"  Found {len(duplicate_ids)} duplicate chunks")
+    print(f"Found {len(duplicate_ids)} duplicate chunks")
 
     if dry_run:
-        print(f"  DRY RUN — nothing deleted. Remove dry_run=True to delete.")
+        print(f"Test — nothing deleted. Remove dry_run=True to delete.")
         return len(duplicate_ids)
 
     # Delete in batches of 500
@@ -425,7 +412,7 @@ def deduplicate(collection_name: str, dry_run=False):
         result = collection.delete_many({"_id": {"$in": batch}})
         deleted += result.deleted_count
 
-    print(f"  Removed {deleted} duplicates. {total - deleted} unique chunks remain.")
+    print(f"Removed {deleted} duplicates. {total - deleted} unique chunks remain.")
     return deleted
 
 
@@ -458,7 +445,7 @@ def list_sources(collection_name: str, silent=False) -> list[str]:
         print(f"\nSources in {collection_name} ({len(sources)} files):")
         for s in sources:
             # Show just the filename, not full path
-            print(f"  {Path(s).name}")
+            print(f"{Path(s).name}")
 
     return sources
 
@@ -478,10 +465,10 @@ def collection_stats():
     db = client[os.getenv("MONGO_DB_NAME", "portfolio_rag")]
 
     print(f"\n{'='*55}")
-    print(f"  Database: {db.name}")
+    print(f"Database: {db.name}")
     print(f"{'='*55}")
-    print(f"  {'Collection':<30} {'Documents':>10} {'Size':>10}")
-    print(f"  {'-'*50}")
+    print(f"{'Collection':<30} {'Documents':>10} {'Size':>10}")
+    print(f"{'-'*50}")
 
     total_docs = 0
     for col_name in sorted(db.list_collection_names()):
@@ -491,11 +478,11 @@ def collection_stats():
         count = db[col_name].count_documents({})
         stats = db.command("collStats", col_name)
         size_mb = stats.get("size", 0) / (1024 * 1024)
-        print(f"  {col_name:<30} {count:>10,} {size_mb:>9.1f}M")
+        print(f"{col_name:<30} {count:>10,} {size_mb:>9.1f}M")
         total_docs += count
 
-    print(f"  {'-'*50}")
-    print(f"  {'TOTAL':<30} {total_docs:>10,}")
+    print(f"{'-'*50}")
+    print(f"{'TOTAL':<30} {total_docs:>10,}")
     print(f"{'='*55}\n")
 
 
@@ -518,7 +505,7 @@ def verify_embeddings(collection_name: str):
     ).limit(5))
 
     if not samples:
-        print(f"  No documents with embeddings found in {collection_name}")
+        print(f"No documents with embeddings found in {collection_name}")
         return
 
     print(f"\nEmbedding check for {collection_name}:")
@@ -527,18 +514,18 @@ def verify_embeddings(collection_name: str):
         emb = s.get("embedding", [])
         dims.add(len(emb))
         source = s.get("source") or s.get("metadata", {}).get("source", "unknown")
-        print(f"  dim={len(emb)}  source={Path(str(source)).name}")
+        print(f"dim={len(emb)}  source={Path(str(source)).name}")
 
     if len(dims) == 1:
         dim = list(dims)[0]
         expected = 3072 if EMBEDDING_PROVIDER == "openai" else 768
         if dim == expected:
-            print(f"  All embeddings are {dim}d — correct for {EMBEDDING_PROVIDER}")
+            print(f"All embeddings are {dim}d — correct for {EMBEDDING_PROVIDER}")
         else:
-            print(f"  WARNING: embeddings are {dim}d but expected {expected}d for {EMBEDDING_PROVIDER}")
+            print(f"WARNING: embeddings are {dim}d but expected {expected}d for {EMBEDDING_PROVIDER}")
     else:
-        print(f"  WARNING: inconsistent dimensions found: {dims}")
-        print(f"  This may cause search errors — consider re-ingesting this collection.")
+        print(f"WARNING: inconsistent dimensions found: {dims}")
+        print(f"This may cause search errors — consider re-ingesting this collection.")
 
 
 # ============================================================
@@ -566,7 +553,7 @@ def reindex_source(file_path: str | Path, category: str):
 
     # Step 2 — re-ingest
     ingest_file(file_path, category)
-    print(f"  Reindex complete.")
+    print(f"Reindex complete.")
 
 
 # ============================================================
@@ -582,16 +569,16 @@ _MONTH_ABBR = {
 
 # Full + abbreviated month names for context filename parsing
 _CONTEXT_MONTH_MAP = {
-    "january": "01",  "jan": "01",
+    "january": "01", "jan": "01",
     "february": "02", "feb": "02",
-    "march": "03",    "mar": "03",
-    "april": "04",    "apr": "04",
+    "march": "03", "mar": "03",
+    "april": "04", "apr": "04",
     "may": "05",
-    "june": "06",     "jun": "06",
-    "july": "07",     "jul": "07",
-    "august": "08",   "aug": "08",
+    "june": "06", "jun": "06",
+    "july": "07", "jul": "07",
+    "august": "08", "aug": "08",
     "september": "09","sep": "09",
-    "october": "10",  "oct": "10",
+    "october": "10", "oct": "10",
     "november": "11", "nov": "11",
     "december": "12", "dec": "12",
 }
@@ -610,8 +597,6 @@ def _extract_context_period(filename: str) -> str | None:
     """
     stem = Path(filename).stem
     s = stem.lower()
-
-    # 1. YYYYMMDD embedded (e.g. GLOBAL_20260227)
     m = re.search(r'(20\d{2})(0[1-9]|1[0-2])\d{2}', stem)
     if m:
         return f"{m.group(1)}-{m.group(2)}"
@@ -631,7 +616,6 @@ def _extract_context_period(filename: str) -> str | None:
         return f"20{m.group(3)}-{m.group(1)}"
 
     # 4. Month name only — infer year from month
-    #    Jun–Dec files without a year are 2025 uploads; Jan–May are 2026
     for name, num in _CONTEXT_MONTH_MAP.items():
         if re.search(rf'\b{name}\b', s):
             inferred = "2025" if int(num) >= 6 else "2026"
@@ -676,23 +660,43 @@ def _extract_aum_summary(cells: list[str]) -> dict | None:
     Row format: | Start AUM | 167820620.6 | End AUM | 175132642.6 | ... | Total PNL | | $7,312,022 | ...
     """
     summary = {}
-    for i, cell in enumerate(cells):
-        cl = cell.lower().strip()
-        if "start aum" in cl and i + 1 < len(cells):
-            v = _parse_number(cells[i + 1])
-            if v is not None:
-                summary["start_aum"] = v
-        elif "end aum" in cl and i + 1 < len(cells):
-            v = _parse_number(cells[i + 1])
-            if v is not None:
-                summary["end_aum"] = v
-        elif "total pnl" in cl:
-            # value may be 1-2 cells away (some formats have an empty cell between)
-            for j in range(i + 1, min(i + 3, len(cells))):
-                v = _parse_number(cells[j])
+    # Two-pass extraction: first pass collects monthly-specific labels (highest priority),
+    # second pass fills in any gaps using generic labels (for older file formats).
+    # This ensures "Start of the Month AUM" always wins over "Start of the Quarter AUM"
+    # when both appear on the same summary row.
+
+    def _is_start(cl):  return "start" in cl and "aum" in cl and "end" not in cl
+    def _is_end(cl):    return "end" in cl and "aum" in cl
+    def _is_total(cl):  return "total" in cl and "pnl" in cl
+    def _is_monthly(cl): return "month" in cl
+
+    for pass_num in (1, 2):  # pass 1 = monthly labels only, pass 2 = any label
+        for i, cell in enumerate(cells):
+            cl = cell.lower().strip()
+            monthly = _is_monthly(cl)
+
+            if pass_num == 1 and not monthly:
+                continue  # first pass: skip non-monthly cells
+
+            if _is_start(cl) and "start_aum" not in summary and i + 1 < len(cells):
+                v = _parse_number(cells[i + 1])
                 if v is not None:
-                    summary["total_pnl"] = v
-                    break
+                    summary["start_aum"] = v
+
+            elif _is_end(cl) and "end_aum" not in summary and i + 1 < len(cells):
+                v = _parse_number(cells[i + 1])
+                if v is not None:
+                    summary["end_aum"] = v
+
+            elif _is_total(cl) and "total_pnl" not in summary:
+                for j in range(i + 1, min(i + 3, len(cells))):
+                    v = _parse_number(cells[j])
+                    if v is not None:
+                        summary["total_pnl"] = v
+                        break
+
+        if "start_aum" in summary and "end_aum" in summary and "total_pnl" in summary:
+            break  # all three found in pass 1 — no need for pass 2
 
     if "start_aum" in summary and "end_aum" in summary:
         start, end = summary["start_aum"], summary["end_aum"]
@@ -766,6 +770,8 @@ def ingest_pnl_structured(
     report_period: str = None,
     source_name: str = None,
     uploaded_by: str = "system",
+    start_aum_override: float = None,
+    end_aum_override: float = None,
 ) -> int:
     """
     Parse a PnL .md or .csv file and insert each row as a structured
@@ -778,9 +784,17 @@ def ingest_pnl_structured(
     source_name overrides the filename used for period detection and metadata
     (useful when file_path is a temp path from Streamlit uploads).
 
+    start_aum_override / end_aum_override: manually supplied AUM figures.
+    If provided they take precedence over anything parsed from the file.
+    Use this as a fallback for older files that have no AUM summary row,
+    or to correct a wrong value without re-formatting the source file.
+
     Usage:
         ingest_pnl_structured("data/pnl/PNL_FEB_2026.md")
         ingest_pnl_structured("/tmp/xyz.md", source_name="PNL_MAR_2026.md")
+        ingest_pnl_structured("data/pnl/PNL_JUL_2025.md",
+                              start_aum_override=160_000_000,
+                              end_aum_override=155_000_000)
     """
     path = Path(file_path)
     if not path.exists():
@@ -794,35 +808,67 @@ def ingest_pnl_structured(
 
     col = get_collection("pnl_table")
     existing = col.count_documents({"report_period": report_period})
-    if existing > 0:
-        print(f"  Period {report_period} already has {existing} rows. "
-              f"Call delete_pnl_period('{report_period}') first to replace.")
-        return 0
-
-    ext = path.suffix.lower()
-    if ext == ".md":
-        rows, aum_summary = _parse_pnl_markdown(path)
-    elif ext == ".csv":
-        rows, aum_summary = _parse_pnl_csv(path)
-    else:
-        raise ValueError(f"Unsupported file type: {ext}. Use .md or .csv")
-
-    if not rows:
-        print("  No rows parsed from file.")
-        return 0
 
     now = datetime.now(timezone.utc)
-    for row in rows:
-        row["report_period"] = report_period
-        row["source_file"] = display_name
-        row["uploaded_by"] = uploaded_by
-        row["uploaded_at"] = now
 
-    col.insert_many(rows)
-    print(f"  Inserted {len(rows)} rows into pnl_table for {report_period}")
+    if existing > 0:
+        # Rows already exist — skip insert but still fall through to summary write
+        # so a missing pnl_summary can be repaired by re-uploading the file.
+        print(f"Period {report_period} already has {existing} rows — skipping row insert.")
+        rows_inserted = 0
 
-    # Store AUM summary for accurate return calculation
-    if aum_summary:
+        # Parse the file anyway so we can extract aum_summary for the repair
+        ext = path.suffix.lower()
+        if ext == ".md":
+            _, aum_summary = _parse_pnl_markdown(path)
+        elif ext == ".csv":
+            _, aum_summary = _parse_pnl_csv(path)
+        else:
+            raise ValueError(f"Unsupported file type: {ext}. Use .md or .csv")
+
+    else:
+        ext = path.suffix.lower()
+        if ext == ".md":
+            rows, aum_summary = _parse_pnl_markdown(path)
+        elif ext == ".csv":
+            rows, aum_summary = _parse_pnl_csv(path)
+        else:
+            raise ValueError(f"Unsupported file type: {ext}. Use .md or .csv")
+
+        if not rows:
+            print("No rows parsed from file.")
+            return 0
+
+        for row in rows:
+            row["report_period"] = report_period
+            row["source_file"] = display_name
+            row["uploaded_by"] = uploaded_by
+            row["uploaded_at"] = now
+
+        col.insert_many(rows)
+        rows_inserted = len(rows)
+        print(f"Inserted {rows_inserted} rows into pnl_table for {report_period}")
+
+    # Apply manual overrides — take precedence over anything parsed from the file.
+    # Handles older files with no AUM row, or correcting a wrong parsed value.
+    if start_aum_override is not None or end_aum_override is not None:
+        aum_summary = aum_summary or {}
+        if start_aum_override is not None:
+            aum_summary["start_aum"] = float(start_aum_override)
+            print(f"AUM override applied: start_aum = {start_aum_override:,.0f}")
+        if end_aum_override is not None:
+            aum_summary["end_aum"] = float(end_aum_override)
+            print(f"AUM override applied: end_aum = {end_aum_override:,.0f}")
+
+    # Recompute return_pct from whatever start/end we have (parsed or overridden)
+    if aum_summary and "start_aum" in aum_summary and "end_aum" in aum_summary:
+        start, end = aum_summary["start_aum"], aum_summary["end_aum"]
+        if start > 0:
+            aum_summary["return_pct"] = round((end - start) / start * 100, 4)
+
+    # Always write pnl_summary — runs whether rows were new or already existed.
+    # This ensures a missing summary is repaired whenever the file is re-uploaded.
+    if aum_summary and "start_aum" in aum_summary and "end_aum" in aum_summary:
         summary_col = get_collection("pnl_summary")
         summary_col.delete_many({"report_period": report_period})  # replace if exists
         summary_col.insert_one({
@@ -833,11 +879,13 @@ def ingest_pnl_structured(
             "uploaded_at": now,
         })
         ret = aum_summary.get("return_pct")
-        print(f"  Stored AUM summary: start={aum_summary.get('start_aum'):,.0f}  "
-              f"end={aum_summary.get('end_aum'):,.0f}  "
-              f"return={ret:+.2f}%" if ret is not None else "  Stored AUM summary (return_pct not computed)")
+        print(f"Stored AUM summary: start={aum_summary['start_aum']:,.0f}  "
+              f"end={aum_summary['end_aum']:,.0f}  "
+              + (f"return={ret:+.2f}%" if ret is not None else "return_pct not computed"))
+    else:
+        print("Warning: no AUM summary found in file and no override provided — pnl_summary not updated.")
 
-    return len(rows)
+    return rows_inserted
 
 
 def delete_pnl_period(report_period: str, dry_run: bool = False) -> int:
@@ -851,15 +899,15 @@ def delete_pnl_period(report_period: str, dry_run: bool = False) -> int:
     col = get_collection("pnl_table")
     count = col.count_documents({"report_period": report_period})
     if count == 0:
-        print(f"  No rows found for period {report_period}")
+        print(f"No rows found for period {report_period}")
         return 0
-    print(f"  Found {count} rows for period {report_period}")
+    print(f"Found {count} rows for period {report_period}")
     if dry_run:
-        print("  DRY RUN — nothing deleted.")
+        print("Test — nothing deleted.")
         return count
     col.delete_many({"report_period": report_period})
     get_collection("pnl_summary").delete_many({"report_period": report_period})
-    print(f"  Deleted {count} rows (+ summary).")
+    print(f"Deleted {count} rows (+ summary).")
     return count
 
 
@@ -895,7 +943,7 @@ def backfill_report_periods(collection_name: str = "context_vectors") -> int:
     print(f"  Total docs: {total}  |  Missing period: {missing}")
 
     if missing == 0:
-        print("  All documents already have report_period. Nothing to do.")
+        print("All documents already have report_period. Nothing to do.")
         return 0
 
     updated = 0
@@ -919,7 +967,7 @@ def backfill_report_periods(collection_name: str = "context_vectors") -> int:
         else:
             skipped += 1
 
-    print(f"  Updated: {updated}  |  Skipped (no period detectable): {skipped}")
+    print(f"Updated: {updated}  |  Skipped (no period detectable): {skipped}")
     return updated
 
 
@@ -937,81 +985,5 @@ def list_pnl_periods() -> list[str]:
         count = col.count_documents({"report_period": p})
         src = col.find_one({"report_period": p}, {"source_file": 1})
         src_name = (src or {}).get("source_file", "?")
-        print(f"  {p}  —  {count} positions  (from {src_name})")
+        print(f"{p}  —  {count} positions  (from {src_name})")
     return periods
-
-
-# # ============================================================
-# # Main — run all folders on direct execution
-# # ============================================================
-
-# if __name__ == "__main__":
-#     import argparse
-
-#     parser = argparse.ArgumentParser(description="MongoDB index management")
-#     parser.add_argument("--action", choices=[
-#         "ingest_all",
-#         "ingest",
-#         "delete",
-#         "reindex",
-#         "deduplicate",
-#         "stats",
-#         "sources",
-#         "verify",
-#     ], default="stats")
-#     parser.add_argument("--category",  help="Category: context, pnl, newsletter, weekly_market_data")
-#     parser.add_argument("--file",      help="File path for ingest/delete/reindex actions")
-#     parser.add_argument("--dry-run",   action="store_true", help="Preview without making changes")
-#     args = parser.parse_args()
-
-#     if args.action == "ingest_all":
-#         for cat in COLLECTIONS:
-#             ingest_folder(cat)
-
-#     elif args.action == "ingest":
-#         if args.file:
-#             ingest_file(args.file, args.category)
-#         elif args.category:
-#             ingest_folder(args.category)
-#         else:
-#             print("Provide --category or --file")
-
-#     elif args.action == "delete":
-#         if not args.file or not args.category:
-#             print("Provide --file and --category")
-#         else:
-#             col_name, _ = COLLECTIONS[args.category]
-#             delete_by_source(args.file, col_name, dry_run=args.dry_run)
-
-#     elif args.action == "reindex":
-#         if not args.file or not args.category:
-#             print("Provide --file and --category")
-#         else:
-#             reindex_source(args.file, args.category)
-
-#     elif args.action == "deduplicate":
-#         if args.category:
-#             col_name, _ = COLLECTIONS[args.category]
-#             deduplicate(col_name, dry_run=args.dry_run)
-#         else:
-#             for cat, (col_name, _) in COLLECTIONS.items():
-#                 deduplicate(col_name, dry_run=args.dry_run)
-
-#     elif args.action == "stats":
-#         collection_stats()
-
-#     elif args.action == "sources":
-#         if not args.category:
-#             for cat, (col_name, _) in COLLECTIONS.items():
-#                 list_sources(col_name)
-#         else:
-#             col_name, _ = COLLECTIONS[args.category]
-#             list_sources(col_name)
-
-#     elif args.action == "verify":
-#         if args.category:
-#             col_name, _ = COLLECTIONS[args.category]
-#             verify_embeddings(col_name)
-#         else:
-#             for cat, (col_name, _) in COLLECTIONS.items():
-#                 verify_embeddings(col_name)

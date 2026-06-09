@@ -4,6 +4,7 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from multiagent import build_agent_system, _extract_period
+from helper import get_latest_opus_model
 from stress_scenarios import STRESS_SCENARIOS
 from eval_collector import EvalCollector
 
@@ -504,23 +505,25 @@ def render_plan_badge(result: dict):
         st.caption(f"↳ {desc}")
 
 
-def render_market_section(result: dict, expanded: bool = True):
+def render_market_section(result: dict, expanded: bool = True, show_controls: bool = True):
     if "market" not in result:
         return
     with st.expander("Market Context Analysis", expanded=expanded):
         st.markdown(safe_md(result["market"]["analysis"]))
-        revision_controls("market", "Market Context")
+        if show_controls:
+            revision_controls("market", "Market Context")
 
 
-def render_performance_section(result: dict, expanded: bool = True):
+def render_performance_section(result: dict, expanded: bool = True, show_controls: bool = True):
     if "performance" not in result:
         return
     with st.expander("Portfolio Performance Analysis", expanded=expanded):
         st.markdown(safe_md(result["performance"]["analysis"]))
-        revision_controls("performance", "Portfolio Performance")
+        if show_controls:
+            revision_controls("performance", "Portfolio Performance")
 
 
-def render_risk_section(result: dict, expanded: bool = True):
+def render_risk_section(result: dict, expanded: bool = True, show_controls: bool = True):
     if "risk" not in result:
         return
     with st.expander("Risk Analysis", expanded=expanded):
@@ -538,13 +541,14 @@ def render_risk_section(result: dict, expanded: bool = True):
             unsafe_allow_html=True,
         )
         st.markdown(safe_md(risk["analysis"]))
-        revision_controls("risk", "Risk Analysis")
+        if show_controls:
+            revision_controls("risk", "Risk Analysis")
 
 
 def render_weekly_section(result: dict, expanded: bool = False):
     if "weekly" not in result:
         return
-    with st.expander("Weekly Market Data Analysis", expanded=expanded):
+    with st.expander("Daily Market Data Analysis", expanded=expanded):
         st.markdown(safe_md(result["weekly"]["analysis"]))
 
 
@@ -598,9 +602,9 @@ def render_result(result: dict, show_revision_controls: bool = True):
         if show_revision_controls:
             revision_controls("newsletter", "Newsletter")
 
-        render_market_section(result, expanded=False)
-        render_performance_section(result, expanded=False)
-        render_risk_section(result, expanded=False)
+        render_market_section(result, expanded=False, show_controls=show_revision_controls)
+        render_performance_section(result, expanded=False, show_controls=show_revision_controls)
+        render_risk_section(result, expanded=False, show_controls=show_revision_controls)
         render_weekly_section(result, expanded=False)
         render_stress_test_section(result)
 
@@ -612,9 +616,9 @@ def render_result(result: dict, show_revision_controls: bool = True):
             if show_revision_controls:
                 revision_controls("market", "Market Context")
         else:
-            render_market_section(result, expanded=("market_analysis" in result.get("plan", {}).get("intent", "")))
-            render_performance_section(result, expanded=True)
-            render_risk_section(result, expanded=True)
+            render_market_section(result, expanded=("market_analysis" in result.get("plan", {}).get("intent", "")), show_controls=show_revision_controls)
+            render_performance_section(result, expanded=True, show_controls=show_revision_controls)
+            render_risk_section(result, expanded=True, show_controls=show_revision_controls)
             render_weekly_section(result, expanded=False)
 
         render_stress_test_section(result)
@@ -625,9 +629,9 @@ def render_result(result: dict, show_revision_controls: bool = True):
             st.markdown(safe_md(result["newsletter"]["newsletter"]))
             if show_revision_controls:
                 revision_controls("newsletter", "Newsletter")
-        render_market_section(result, expanded=False)
-        render_performance_section(result, expanded=False)
-        render_risk_section(result, expanded=False)
+        render_market_section(result, expanded=False, show_controls=show_revision_controls)
+        render_performance_section(result, expanded=False, show_controls=show_revision_controls)
+        render_risk_section(result, expanded=False, show_controls=show_revision_controls)
         render_weekly_section(result, expanded=False)
         render_stress_test_section(result)
 

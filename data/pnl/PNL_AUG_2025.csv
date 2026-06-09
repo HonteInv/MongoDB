@@ -1,0 +1,19 @@
+﻿Asset Class,Positions,Ticker/Market Data,Position Type,Position Size,P&L Estimate
+rate,Rates (Front end) (DV01),USGG2YR Index,DV01,117000,3284680
+rate,Long End TIPS (DV01),USGGT20Y Index,DV01,140000,14000
+rate,Long Gilts,GUKG10 index,DV01,,0
+rate,Muni (ratio sensitivity),USSMSO25 CMPN Curncy,Ratio Sensitivity,745000,186250
+equity,Unraium Miners,CCJ Equity,Notional,6160000,202236.7543
+equity,PM Miners,GDX Equity,Notional,5620000,1254814.098
+commodity,Silver,SIZ5 Comdty,Notional,14320000,1359959.13
+commodity,Platinum,PLF6 comdty,Notional,20920000,1263505.787
+commodity,Copper,HG1 comdty,Notional,16110000,606737.8574
+FX,USDCNH,USDCNH curncy,Notional,366000000,-3612228.208
+FX,USDHKD,USDHKD curncy,Notional,366000000,232836.4368
+FX,CHFJPY,CHFJPY curncy,Notional,-160230000,1677433.043
+FX,USDCHF,CHF curncy,Notional,15790000,-229375.8464
+crypto,Crypto,IBIT Equity,Notional,21400000,-1574668.275
+equity,Stoxx 50 Dividend Future,DEDZ8 index,Notional,8940000,-29330.70866
+equity,Short SPX,ES1 index,Notional,-32190000,-497425.5795
+,,,,,
+,,,,Total,4139424.488
