@@ -5,8 +5,8 @@ Takes a finished result + a free-text complaint, works out what actually needs
 to change, and re-runs only the responsible agent(s) in dependency order.
 
 Two-phase by design so the UI can confirm before anything runs:
-    plan_revision(complaint, result)   → a PLAN, runs no agents
-    execute_revision(plan, result)     → runs the plan, returns updated result
+    plan_revision(complaint, result) → a PLAN, runs no agents
+    execute_revision(plan, result) → runs the plan, returns updated result
 
 Engine only — all UI lives in query_app.py. multiagent.py is untouched; this
 class takes an already-built OrchestratorAgent and drives its public agents.
@@ -26,11 +26,11 @@ from helper import get_latest_opus_model
 class ValidationAgent:
     # Which downstream sections read a given section's output.
     DEPENDENTS = {
-        "market":      ["risk", "newsletter"],
+        "market": ["risk", "newsletter"],
         "performance": ["risk", "newsletter"],
-        "weekly":      ["newsletter"],
-        "risk":        ["newsletter"],
-        "newsletter":  [],
+        "weekly": ["newsletter"],
+        "risk": ["newsletter"],
+        "newsletter": [],
     }
 
     # Canonical run order — cascade always replays in this order.
@@ -51,7 +51,7 @@ class ValidationAgent:
         return self._mongo_client[os.getenv("MONGO_DB_NAME", "portfolio_rag")]
 
     # ----------------------------------------------------------
-    # PHASE A — plan (runs no agents)
+    # PHASE A — plan 
     # ----------------------------------------------------------
 
     async def plan_revision(self, complaint: str, current_result: dict) -> dict:
@@ -60,14 +60,14 @@ class ValidationAgent:
 
         Plan shape:
         {
-          "complaint":       original text,
-          "owner":           which section owns the complaint,
-          "diagnosis":       short explanation,
-          "diagnosis_type":  "data" | "generation",
-          "targeted_query":  rewritten instruction for the owner agent,
-          "materiality":     "material" | "cosmetic",
-          "dirty_set":       ordered list of sections to re-run,
-          "summary":         plain-English description for the confirm step,
+          "complaint": original text,
+          "owner": which section owns the complaint,
+          "diagnosis": short explanation,
+          "diagnosis_type": "data" | "generation",
+          "targeted_query": rewritten instruction for the owner agent,
+          "materiality": "material" | "cosmetic",
+          "dirty_set": ordered list of sections to re-run,
+          "summary": plain-English description for the confirm step,
         }
         """
         present = [s for s in self.PIPELINE_ORDER if s in current_result]
@@ -79,18 +79,18 @@ class ValidationAgent:
             "data problem or a generation/wording problem, and rewrite the complaint "
             "as a specific instruction for that section's agent.\n\n"
             "Sections:\n"
-            "  market       — macro market context (rates, FX, equities, central banks)\n"
+            "  market — macro market context (rates, FX, equities, central banks)\n"
             "  performance  — portfolio P&L, returns, attribution (numbers live here)\n"
-            "  weekly       — daily/weekly market data trends\n"
-            "  risk         — DV01, notional, concentration, stress framing\n"
-            "  newsletter   — the written investor letter (tone, structure, prose)\n\n"
+            "  weekly — daily/weekly market data trends\n"
+            "  risk — DV01, notional, concentration, stress framing\n"
+            "  newsletter — the written investor letter (tone, structure, prose)\n\n"
             f"Sections present in this report: {present}\n\n"
             "diagnosis_type:\n"
-            "  data       — a number/fact appears wrong (lives in the source data)\n"
+            "  data — a number/fact appears wrong (lives in the source data)\n"
             "  generation — the data is fine but the model misread, mis-worded, or mis-structured it\n\n"
             "materiality:\n"
-            "  material   — the change alters a number or fact that other sections depend on\n"
-            "  cosmetic   — tone/structure/wording only; downstream sections need not change\n\n"
+            "  material — the change alters a number or fact that other sections depend on\n"
+            "  cosmetic — tone/structure/wording only; downstream sections need not change\n\n"
             "Return ONLY valid JSON, no markdown fences:\n"
             "{\n"
             '  "owner": "performance",\n'
@@ -119,7 +119,7 @@ class ValidationAgent:
                 parsed = json.loads(match.group())
                 owner = parsed.get("owner")
         except Exception as e:
-            print(f"  ValidationAgent.plan_revision failed ({e}) — falling back to newsletter owner")
+            print(f"ValidationAgent.plan_revision failed ({e}) — falling back to newsletter owner")
 
         # Fallback if the router failed or returned something unusable
         if owner not in self.VALID_OWNERS or owner not in present:
@@ -138,14 +138,14 @@ class ValidationAgent:
         dirty = [s for s in self.PIPELINE_ORDER if s in dirty]  # canonical order, deduped
 
         plan = {
-            "complaint":      complaint,
-            "owner":          owner,
-            "diagnosis":      parsed.get("diagnosis", ""),
+            "complaint": complaint,
+            "owner": owner,
+            "diagnosis": parsed.get("diagnosis", ""),
             "diagnosis_type": parsed.get("diagnosis_type", "generation"),
             "targeted_query": parsed.get("targeted_query", complaint),
-            "materiality":    materiality,
-            "dirty_set":      dirty,
-            "summary":        self._build_summary(owner, dirty, parsed, present),
+            "materiality": materiality,
+            "dirty_set": dirty,
+            "summary": self._build_summary(owner, dirty, parsed, present),
         }
         return plan
 
@@ -173,7 +173,7 @@ class ValidationAgent:
         return "\n\n".join(lines)
 
     # ----------------------------------------------------------
-    # PHASE B — execute (runs the dirty set in order)
+    # PHASE B — execute (runs the affected set in order)
     # ----------------------------------------------------------
 
     async def execute_revision(self, plan: dict, current_result: dict) -> dict:
@@ -229,9 +229,9 @@ class ValidationAgent:
 
         # Append to the revisions log (same shape multiagent.py uses)
         result.setdefault("revisions", []).append({
-            "section":   plan["owner"],
-            "feedback":  plan["complaint"],
-            "via":       "validation_agent",
+            "section": plan["owner"],
+            "feedback": plan["complaint"],
+            "via": "validation_agent",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         return result
