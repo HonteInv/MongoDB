@@ -36,7 +36,7 @@ def revision_controls(section_key: str, section_label: str, result_idx: int = -1
 
     if pressed and feedback.strip():
         st.session_state["pending_revision"] = {
-            "section":  section_key,
+            "section": section_key,
             "feedback": feedback.strip(),
         }
         st.rerun()
@@ -429,7 +429,7 @@ if run_stress:
 
     if selected_period and selected_period != "(no data)":
         stress_options = {
-            "period":        selected_period,
+            "period": selected_period,
             "scenario_keys": selected_keys,
         }
 
@@ -445,13 +445,17 @@ if generate and query.strip():
             orchestrator.run(query, stress_test_options=stress_options)
         )
 
-    # Save to session history (RAM only — private to this user)
+    # Save to session history (RAM only — private to user)
     st.session_state.history.append({
-        "query":   query,
-        "result":  result,
+        "query": query,
+        "result": result,
     })
 
-    # Auto-save to eval_examples collection for future rating / fine-tuning
+    # clear any prepared exports — they belong to the previous result
+    for k in ("export_pdf", "export_docx", "export_pdf_name", "export_docx_name"):
+        st.session_state.pop(k, None)
+
+    # auto-save to eval_examples collection for future rating / fine-tuning
     try:
         category = result.get("plan", {}).get("intent") or result.get("response_type", "unknown")
         EvalCollector().save_example(result, category=category)
@@ -462,21 +466,16 @@ elif generate:
     st.warning("Please enter a request.")
 
 # ============================================================
-# Results — show most recent first
-# ============================================================
-
-# ============================================================
-# Revision execution — runs before display so the updated
-# result is shown immediately in the same render pass.
+# Revision execution 
 # ============================================================
 if st.session_state.get("pending_revision") and st.session_state.history:
     rev = st.session_state.pop("pending_revision")
     current = st.session_state.history[-1]["result"]
     label_map = {
-        "newsletter":  "Newsletter",
-        "risk":        "Risk Analysis",
+        "newsletter": "Newsletter",
+        "risk": "Risk Analysis",
         "performance": "Portfolio Performance",
-        "market":      "Market Context",
+        "market": "Market Context",
     }
     label = label_map.get(rev["section"], rev["section"].title())
     with st.spinner(f"Revising {label}..."):
@@ -484,18 +483,20 @@ if st.session_state.get("pending_revision") and st.session_state.history:
             orchestrator.revise_section(rev["section"], rev["feedback"], current)
         )
     st.session_state.history[-1]["result"] = updated
+    # Prepared exports are now stale — drop them
+    for k in ("export_pdf", "export_docx", "export_pdf_name", "export_docx_name"):
+        st.session_state.pop(k, None)
     st.rerun()
 
 def render_plan_badge(result: dict):
-    """Show a small pill describing what the planner decided to run."""
     plan = result.get("plan")
     if not plan:
         return
-    intent      = plan.get("intent", "").replace("_", " ").title()
-    agents_run  = plan.get("agents", [])
-    desc        = plan.get("description", "")
-    reasoning   = plan.get("reasoning", "")
-    badge_parts = [f"🤖 **{intent}**"]
+    intent = plan.get("intent", "").replace("_", " ").title()
+    agents_run = plan.get("agents", [])
+    desc = plan.get("description", "")
+    reasoning = plan.get("reasoning", "")
+    badge_parts = [f"**{intent}**"]
     if agents_run:
         badge_parts.append(f"agents: {', '.join(agents_run)}")
     if reasoning and reasoning != "fallback":
@@ -557,7 +558,7 @@ def render_stress_test_section(result: dict):
     if not st_result:
         return
     if st_result.get("error"):
-        with st.expander("⚠ Stress Test — Error"):
+        with st.expander("Stress Test — Error"):
             st.warning(st_result["error"])
     else:
         label = "Stress Test — " + ", ".join(st_result.get("scenarios_used", []))
@@ -577,14 +578,10 @@ def render_stress_test_section(result: dict):
 
 def render_result(result: dict, show_revision_controls: bool = True):
     """
-    Render a result dict based on its response_type.
-
-    newsletter  → newsletter block front-and-centre, other sections collapsed
-    analysis    → relevant sections expanded, no newsletter block
-    chat        → market context as a clean answer
+    Render a result dict based on its response_type (newsletter, analysis, chat)
     """
     response_type = result.get("response_type", "newsletter")
-    revisions     = result.get("revisions", [])
+    revisions = result.get("revisions", [])
 
     render_plan_badge(result)
 
@@ -595,7 +592,7 @@ def render_result(result: dict, show_revision_controls: bool = True):
         )
         st.caption(f"✏ {len(revisions)} revision(s) — {rev_summary}")
 
-    # ── Newsletter layout ─────────────────────────────────────
+    # Newsletter format
     if response_type == "newsletter" and result.get("newsletter"):
         st.subheader("Generated Newsletter")
         st.markdown(safe_md(result["newsletter"]["newsletter"]))
@@ -608,9 +605,8 @@ def render_result(result: dict, show_revision_controls: bool = True):
         render_weekly_section(result, expanded=False)
         render_stress_test_section(result)
 
-    # ── Analysis layout ───────────────────────────────────────
+    # other
     elif response_type in ("analysis", "chat"):
-        # Show market as primary section for chat/market-only queries
         if result.get("market") and not result.get("performance") and not result.get("risk"):
             st.markdown(safe_md(result["market"]["analysis"]))
             if show_revision_controls:
@@ -623,7 +619,7 @@ def render_result(result: dict, show_revision_controls: bool = True):
 
         render_stress_test_section(result)
 
-    # ── Fallback: show whatever we have ──────────────────────
+    # Fallback failsafe
     else:
         if result.get("newsletter"):
             st.markdown(safe_md(result["newsletter"]["newsletter"]))
@@ -635,7 +631,7 @@ def render_result(result: dict, show_revision_controls: bool = True):
         render_weekly_section(result, expanded=False)
         render_stress_test_section(result)
 
-    # Debug: critique logs — admin only
+    # Debug critique logs 
     if show_revision_controls and st.session_state.get("role") == "admin":
         with st.expander("Debug: Self-Critique Logs", expanded=False):
             for agent_key, lbl in [("performance", "Portfolio Performance"), ("newsletter", "Newsletter")]:
@@ -648,10 +644,53 @@ def render_result(result: dict, show_revision_controls: bool = True):
                     st.markdown(f"**{lbl}** — no critique log")
 
 
+def render_export_controls(result: dict):
+    """
+    Download the full result as PDF or DOCX. Lazy: nothing is generated until
+    the user clicks Prepare, then the two download buttons appear.
+    """
+    from export import build_pdf, build_docx, export_filename
+
+    st.markdown(
+        '<div class="section-label" style="margin-top:0.3rem;">Download</div>',
+        unsafe_allow_html=True,
+    )
+    col_prep, col_pdf, col_docx = st.columns([1, 1, 1])
+
+    with col_prep:
+        if st.button("Prepare files", key="btn_prepare_export", use_container_width=True):
+            with st.spinner("Generating..."):
+                st.session_state["export_pdf"] = build_pdf(result)
+                st.session_state["export_docx"] = build_docx(result)
+                st.session_state["export_pdf_name"] = export_filename(result, "pdf")
+                st.session_state["export_docx_name"] = export_filename(result, "docx")
+
+    if st.session_state.get("export_pdf"):
+        with col_pdf:
+            st.download_button(
+                "PDF",
+                data=st.session_state["export_pdf"],
+                file_name=st.session_state["export_pdf_name"],
+                mime="application/pdf",
+                key="dl_pdf",
+                use_container_width=True,
+            )
+        with col_docx:
+            st.download_button(
+                "DOCX",
+                data=st.session_state["export_docx"],
+                file_name=st.session_state["export_docx_name"],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="dl_docx",
+                use_container_width=True,
+            )
+
+
 if st.session_state.history:
     latest = st.session_state.history[-1]
 
     st.divider()
+    render_export_controls(latest["result"])
     render_result(latest["result"], show_revision_controls=True)
 
     # ── Session history — previous queries this session ────
