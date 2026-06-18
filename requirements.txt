@@ -16,3 +16,4 @@ xhtml2pdf
 markdown
 python-docx
 htmldocx
+pymupdf

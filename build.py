@@ -595,7 +595,8 @@ def _extract_context_period(filename: str) -> str | None:
                              August 1 Payroll.pdf            → 2025-08 (inferred)
     Returns None if no period can be determined.
     """
-    stem = Path(filename).stem
+    # Treat underscores as separators so "Crypto_March_2026" parses like "Crypto March 2026"
+    stem = Path(filename).stem.replace("_", " ")
     s = stem.lower()
     m = re.search(r'(20\d{2})(0[1-9]|1[0-2])\d{2}', stem)
     if m:
