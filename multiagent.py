@@ -153,15 +153,50 @@ class BaseAgent:
 class MarketContextAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Daily-tagged narrative collection (date/section/topic pre-filtering)
         self.context_store = get_vector_store(
-            "context_vectors",
-            "vector_index",
+            "context_daily",
+            "daily_index",
             self.embedding,
         )
+        # Exact-number tables (structured, queried by date — not vectors)
+        self._mongo = MongoClient(os.getenv("MONGO_URI_USER"))
         # CLAUDE_CONTEXT_MODEL env var takes priority; otherwise use the model
         # already resolved and passed in from build_agent_system().
         if os.getenv("CLAUDE_CONTEXT_MODEL"):
             self.model = os.getenv("CLAUDE_CONTEXT_MODEL")
+
+    def _tables_col(self):
+        return self._mongo[os.getenv("MONGO_DB_NAME", "portfolio_rag")]["daily_table_data"]
+
+    def _get_period_tables(self, period: str) -> tuple[str, list[str]]:
+        """
+        Exact month-end closes for the period from daily_table_data. Returns
+        (formatted_block, data_warnings). The block is "" if no tables exist
+        (e.g. before backfill). data_warnings lists any tables flagged incomplete
+        or low-confidence, so the agent can disclose gaps to the user.
+        """
+        col = self._tables_col()
+        days = sorted(col.distinct("report_day", {"report_month": period}))
+        if not days:
+            return "", []
+        last = days[-1]  # month-end snapshot
+        lines = [f"Exact market closes as of {last} (month-end):"]
+        warnings: list[str] = []
+        for doc in col.find({"report_day": last}, {"_id": 0}):
+            q = doc.get("quality", {}) or {}
+            flagged = q.get("incomplete") or (q.get("confidence") or 100) < 95 or q.get("empty_cells")
+            note = "  [DATA NOTE: this table may be incomplete or uncertain]" if flagged else ""
+            if flagged:
+                warnings.append(
+                    f"{doc['exhibit']} ({last}): possible missing/uncertain values "
+                    f"(confidence {q.get('confidence')}%)"
+                )
+            lines.append(f"\n[{doc['exhibit']}]{note}")
+            for row, cols in doc.get("table", {}).items():
+                vals = ", ".join(f"{k}={'?' if v is None else v}" for k, v in cols.items())
+                lines.append(f"  {row}: {vals}")
+        return "\n".join(lines), warnings
 
     def _build_macro_query(self, question: str) -> str:
         """Reframe the question as a macro-focused vector search query."""
@@ -182,42 +217,68 @@ class MarketContextAgent(BaseAgent):
         period = _extract_period(question)
         macro_query = self._build_macro_query(question)
 
-        # Fetch extra docs so we have room to filter by period
-        fetch_k = self.context_k * 3
-        all_docs = self._search(self.context_store, macro_query, k=fetch_k)
-
-        # Post-filter to the detected period if metadata exists on the chunks
+        # ── Narrative: PRE-filtered vector search (the right month, prose only) ──
+        pre_filter: dict = {"content_type": {"$ne": "data_table"}}
         if period:
-            period_docs = [d for d in all_docs if d.metadata.get("report_period") == period]
-            docs = period_docs[:self.context_k] if len(period_docs) >= 5 else all_docs[:self.context_k]
-        else:
-            docs = all_docs[:self.context_k]
+            pre_filter["report_month"] = {"$eq": period}
+        docs = self.context_store.similarity_search(
+            macro_query, k=self.context_k, pre_filter=pre_filter
+        )
+
+        # ── Honesty: if a period was asked for but has no context, say so ──
+        if period and not docs:
+            return {
+                "agent": "MarketContextAgent",
+                "analysis": (
+                    f"No market context is available for {period} in the database. "
+                    f"I won't substitute commentary from other periods."
+                ),
+                "period": period,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         month_label = macro_query.split(" macro")[0] if period else "the relevant period"
 
+        # ── Exact numbers for the period (optional — empty before backfill) ──
+        # A/B toggle: set USE_EXACT_TABLES=false to run narrative-only (no daily_table
+        # numbers) for comparison against the with-numbers version.
+        use_tables = os.getenv("USE_EXACT_TABLES", "true").lower() == "true"
+        tables_block, data_warnings = (
+            self._get_period_tables(period) if (period and use_tables) else ("", [])
+        )
+
         system_prompt = (
             "You are a macro market analyst for a hedge fund. "
-            "You will be given a set of source documents. "
+            "You will be given source documents and, when available, an EXACT MARKET DATA "
+            "block of verified closing levels. "
             "Your ONLY job is to summarize what those documents say. "
-            "Every single claim you make must be directly supported by the provided documents. "
+            "Every single claim you make must be directly supported by the provided material. "
             "Do NOT use any knowledge from your training data. "
             "Do NOT invent events, figures, yields, price moves, or central bank actions. "
-            "If a topic is not covered in the documents, do not mention it. "
-            "If the documents are insufficient, say exactly which topics are missing."
+            "When citing specific levels or numbers, use the EXACT MARKET DATA figures verbatim — "
+            "never estimate a number that is given there. "
+            "If a value is shown as '?' or a table is marked with a DATA NOTE, treat it as "
+            "missing — do not guess it, and briefly flag to the reader that some data was "
+            "incomplete for that table. "
+            "If a topic is not covered in the documents, do not mention it."
         )
 
         user_prompt = f"""
 Source documents from {month_label}:
 
 {chr(10).join(f'---{chr(10)}{doc.page_content}' for doc in docs)}
+{f'''
+---
+EXACT MARKET DATA (use these figures verbatim for any specific levels):
+{tables_block}''' if tables_block else ''}
 
 ---
-Based ONLY on the source documents above, summarize:
+Based ONLY on the material above, summarize:
 1. The key macro events and market-moving developments
 2. Which asset classes were affected and how (rates, FX, equities, commodities)
 3. Any central bank actions or policy shifts mentioned
 
-Do not add anything not stated in the documents above.
+Do not add anything not stated above.
 {f'''
 ---
 REVISION FEEDBACK FROM USER:
@@ -230,6 +291,9 @@ Address this feedback in your revised response. Keep everything that was correct
         return {
             "agent": "MarketContextAgent",
             "analysis": analysis,
+            "period": period,
+            "has_exact_data": bool(tables_block),
+            "data_warnings": data_warnings,   # surfaced to the user if numbers were incomplete
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
