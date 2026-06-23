@@ -12,3 +12,8 @@ pymongo[srv]
 pypdf
 python-dotenv
 streamlit
+xhtml2pdf
+markdown
+python-docx
+htmldocx
+pymupdf
