@@ -330,6 +330,13 @@ if not is_authenticated(st.session_state):
 def get_orchestrator():
     return build_agent_system()
 
+@st.cache_resource
+def get_validator():
+    """Validation/revision agent — wraps the shared orchestrator. Created once."""
+    from validation_agent import ValidationAgent
+    orch = get_orchestrator()
+    return ValidationAgent(orch, orch._anthropic, orch._model)
+
 @st.cache_data(ttl=300)
 def get_available_periods() -> list[str]:
     """Fetch PnL periods from MongoDB — cached for 5 min."""
@@ -339,6 +346,7 @@ def get_available_periods() -> list[str]:
     return sorted(col.distinct("report_period"))
 
 orchestrator = get_orchestrator()
+validator = get_validator()
 
 # ============================================================
 # Per-user session history
@@ -486,6 +494,29 @@ if st.session_state.get("pending_revision") and st.session_state.history:
     # Prepared exports are now stale — drop them
     for k in ("export_pdf", "export_docx", "export_pdf_name", "export_docx_name"):
         st.session_state.pop(k, None)
+    st.rerun()
+
+# ============================================================
+# Validation agent — execute a confirmed revision plan.
+# Snapshots the current result onto the version stack first,
+# then runs the plan over the dirty set.
+# ============================================================
+if st.session_state.get("pending_validation_execute") and st.session_state.history:
+    plan = st.session_state.pop("pending_validation_execute")
+    hist_entry = st.session_state.history[-1]
+    current = hist_entry["result"]
+
+    # Snapshot the pre-revision result onto this entry's version stack
+    from validation_agent import ValidationAgent
+    hist_entry.setdefault("versions", []).append({
+        "label":  ValidationAgent.version_label(plan),
+        "result": current,
+    })
+
+    with st.spinner("Applying revision..."):
+        updated = asyncio.run(validator.execute_revision(plan, current))
+    hist_entry["result"] = updated
+    st.session_state.pop("validation_complaint_text", None)  # clear the box
     st.rerun()
 
 def render_plan_badge(result: dict):
@@ -644,6 +675,82 @@ def render_result(result: dict, show_revision_controls: bool = True):
                     st.markdown(f"**{lbl}** — no critique log")
 
 
+def render_validation_agent(hist_entry: dict):
+    """
+    validation_agent block — single complaint box + version stack + confirm step.
+    Sits at the top of the latest response. Additive: the existing per-section
+    revise controls remain untouched below.
+    """
+    result = hist_entry["result"]
+
+    st.markdown(
+        '<div class="section-label" style="margin-top:0.5rem;">validation_agent</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Version stack — restore a previous version of this result ──
+    versions = hist_entry.get("versions", [])
+    if versions:
+        col_v, col_r = st.columns([5, 1])
+        with col_v:
+            labels = [f"{i+1}. {v['label']}" for i, v in enumerate(versions)]
+            choice = st.selectbox(
+                "Previous versions",
+                options=labels,
+                key="version_select",
+                label_visibility="collapsed",
+            )
+        with col_r:
+            if st.button("Restore", key="btn_restore_version", use_container_width=True):
+                idx = labels.index(choice)
+                # Restore = new snapshot (so the user gets free redo)
+                hist_entry.setdefault("versions", []).append({
+                    "label":  "before restore",
+                    "result": result,
+                })
+                hist_entry["result"] = versions[idx]["result"]
+                st.rerun()
+
+    # ── Pending plan → confirm step ──
+    pending_plan = st.session_state.get("pending_validation_plan")
+    if pending_plan:
+        st.markdown(
+            '<div class="section-label" style="margin-top:0.8rem;">Proposed change</div>',
+            unsafe_allow_html=True,
+        )
+        st.info(pending_plan["summary"])
+        col_c, col_x = st.columns([1, 1])
+        with col_c:
+            if st.button("Confirm", key="btn_validation_confirm", use_container_width=True):
+                st.session_state["pending_validation_execute"] = pending_plan
+                st.session_state.pop("pending_validation_plan", None)
+                st.rerun()
+        with col_x:
+            if st.button("Cancel", key="btn_validation_cancel", use_container_width=True):
+                # Keep the complaint text so the user can edit and re-plan
+                st.session_state.pop("pending_validation_plan", None)
+                st.rerun()
+        return
+
+    # ── Complaint box ──
+    complaint = st.text_input(
+        "validation_complaint",
+        label_visibility="collapsed",
+        placeholder="Something off? e.g. 'the Feb numbers look wrong' or 'make the outlook less defensive'",
+        key="validation_complaint_text",
+    )
+    if st.button("Analyze request", key="btn_validation_analyze"):
+        if complaint.strip():
+            with st.spinner("Working out what needs to change..."):
+                plan = asyncio.run(validator.plan_revision(complaint.strip(), result))
+            st.session_state["pending_validation_plan"] = plan
+            st.rerun()
+        else:
+            st.warning("Describe what you'd like changed first.")
+
+    # ── Explanation of the last revision ──
+    if result.get("validation_explanation"):
+        st.caption(f"✓ {result['validation_explanation']}")
 def render_export_controls(result: dict):
     """
     Download the full result as PDF or DOCX. Lazy: nothing is generated until
@@ -690,6 +797,7 @@ if st.session_state.history:
     latest = st.session_state.history[-1]
 
     st.divider()
+    render_validation_agent(latest)
     render_export_controls(latest["result"])
     render_result(latest["result"], show_revision_controls=True)
 
