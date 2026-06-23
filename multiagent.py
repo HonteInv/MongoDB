@@ -466,50 +466,6 @@ Address this feedback in your revised response. Keep everything that was correct
 
 
 # ============================================================
-# Weekly Market Data Agent
-# ============================================================
-
-class WeeklyMarketDataAgent(BaseAgent):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.weekly_store = get_vector_store(
-            "daily_vectors",
-            "vector_index",
-            self.embedding,
-        )
-
-    def analyze(self, question: str) -> Dict[str, Any]:
-        search_query = f"{question} daily market data"
-        docs = self._search(self.weekly_store, search_query, k=self.context_k)
-
-        system_prompt = (
-            "You are a market data analyst for a hedge fund. "
-            "Summarize the key daily market trends in the data, focusing on: (1) significant moves in rates, "
-            "FX, equities, and commodities, (2) inflection points or trend breaks, and (3) how the "
-            "daily data fits into the broader macro narrative. "
-            "Pay particular attention to month-end movements, as end-of-month prints can have an "
-            "outsized effect on portfolio valuations. "
-            "Connect data points to each other — e.g. how a rates move influenced FX or equity positioning. "
-            "Strictly use only the provided context."
-        )
-
-        user_prompt = f"""
-Question: {question}
-
-Daily Market Data:
-{''.join(doc.page_content for doc in docs[:20])}
-"""
-
-        analysis = self._call_claude(system_prompt, user_prompt)
-
-        return {
-            "agent": "WeeklyMarketDataAgent",
-            "analysis": analysis,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-
-# ============================================================
 # Risk Agent
 # ============================================================
 
@@ -1068,7 +1024,6 @@ class NewsletterWriterAgent(BaseAgent):
         market_context: str,
         portfolio_performance: str,
         risk_analysis: str,
-        weekly_market_data: str = "",
         pnl_summary: dict | None = None,
         feedback: str = "",
     ) -> Dict[str, Any]:
@@ -1114,9 +1069,6 @@ Question: {question}
 
 Market Context:
 {market_context}
-
-Daily Market Data:
-{weekly_market_data}
 
 Portfolio Performance:
 {portfolio_performance}
@@ -1169,7 +1121,6 @@ class OrchestratorAgent:
 
         self.market = MarketContextAgent(embedding, anthropic_client, context_k, model=self._model)
         self.performance = PortfolioPerformanceAgent(embedding, anthropic_client, context_k, model=self._model)
-        self.weekly = WeeklyMarketDataAgent(embedding, anthropic_client, context_k, model=self._model)
         self.risk = RiskAnalystAgent(embedding, anthropic_client, context_k, model=self._model)
         self.writer = NewsletterWriterAgent(embedding, anthropic_client, context_k, model=self._model)
 
@@ -1220,18 +1171,17 @@ class OrchestratorAgent:
             "Available agents:\n"
             "performance  — portfolio P&L, returns, attribution for a specific period\n"
             "market — macro market context (rates, FX, equities, central banks)\n"
-            "weekly — weekly market data trends\n"
             "risk — risk analysis with DV01, notional, concentration (needs performance + market)\n"
             "newsletter — full investor letter (needs performance + market + risk)\n"
             "stress_test — scenario stress test (needs performance + market)\n\n"
             f"Available data periods: {periods_str}\n\n"
             "Intent → agent mapping (use EXACTLY these agent lists):\n"
-            "  newsletter       → [performance, market, weekly, risk, newsletter]\n"
-            "  market_analysis  → [market, weekly]\n"
+            "  newsletter       → [performance, market, risk, newsletter]\n"
+            "  market_analysis  → [market]\n"
             "  performance      → [performance]\n"
             "  risk_analysis    → [performance, market, risk]\n"
             "  stress_test      → [performance, market, stress_test]\n"
-            "  full_brief       → [performance, market, weekly, risk]\n"
+            "  full_brief       → [performance, market, risk]\n"
             "  qa               → [market]\n\n"
             "response_type rules:\n"
             "  newsletter intent              → response_type: newsletter\n"
@@ -1278,7 +1228,7 @@ class OrchestratorAgent:
             "description": "Full pipeline (planner fallback)",
             "period": _extract_period(query),
             "response_type": "newsletter",
-            "agents": ["performance", "market", "weekly", "risk", "newsletter"],
+            "agents": ["performance", "market", "risk", "newsletter"],
             "reasoning": "fallback",
         }
 
@@ -1320,8 +1270,6 @@ class OrchestratorAgent:
             group1["market"] = asyncio.to_thread(self.market.analyze, query)
         if "performance" in agents_needed:
             group1["performance"] = asyncio.to_thread(self.performance.analyze, query)
-        if "weekly" in agents_needed:
-            group1["weekly"] = asyncio.to_thread(self.weekly.analyze, query)
 
         if group1:
             gathered = await asyncio.gather(*group1.values())
@@ -1346,7 +1294,6 @@ class OrchestratorAgent:
                 result.get("market", {}).get("analysis", ""),
                 result.get("performance", {}).get("analysis", ""),
                 result.get("risk", {}).get("analysis", ""),
-                result.get("weekly", {}).get("analysis", ""),
                 result.get("performance", {}).get("pnl_summary"),
             )
             result["newsletter"] = newsletter_result
@@ -1423,7 +1370,6 @@ class OrchestratorAgent:
                 result.get("market", {}).get("analysis", ""),
                 result.get("performance", {}).get("analysis", ""),
                 result.get("risk", {}).get("analysis", ""),
-                result.get("weekly", {}).get("analysis", ""),
                 result.get("performance", {}).get("pnl_summary"),
                 feedback,
             )
@@ -1445,7 +1391,6 @@ class OrchestratorAgent:
                     result.get("market", {}).get("analysis", ""),
                     result.get("performance", {}).get("analysis", ""),
                     risk_result["analysis"],
-                    result.get("weekly", {}).get("analysis", ""),
                     result.get("performance", {}).get("pnl_summary"),
                 )
                 result["newsletter"] = writer_result
@@ -1464,7 +1409,6 @@ class OrchestratorAgent:
                     result.get("market", {}).get("analysis", ""),
                     perf_result["analysis"],
                     result.get("risk", {}).get("analysis", ""),
-                    result.get("weekly", {}).get("analysis", ""),
                     perf_result.get("pnl_summary"),
                 )
                 result["newsletter"] = writer_result
@@ -1483,7 +1427,6 @@ class OrchestratorAgent:
                     market_result["analysis"],
                     result.get("performance", {}).get("analysis", ""),
                     result.get("risk", {}).get("analysis", ""),
-                    result.get("weekly", {}).get("analysis", ""),
                     result.get("performance", {}).get("pnl_summary"),
                 )
                 result["newsletter"] = writer_result

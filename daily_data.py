@@ -283,14 +283,17 @@ def make_chunk(text, source, report_day, report_month, section, region, content_
     }
 
 
-def build_chunks_for_file(file_path: str | Path) -> tuple[list[dict], dict]:
+def build_chunks_for_file(file_path: str | Path, source_name: str = None) -> tuple[list[dict], dict]:
     """
     Load a PDF and produce (chunk_dicts, report). The report records detected days
     and any warnings (used for the verify step and the manual-fix UI later).
+
+    source_name overrides the stored source filename — needed when file_path is a
+    temp path from a Streamlit upload (same pattern as ingest_pnl_structured).
     """
     path = Path(file_path)
     full = load_pdf_text(path)
-    source = path.name
+    source = source_name or path.name
 
     report = {"source": source, "detected_daily": True, "days": [], "warnings": []}
     chunks: list[dict] = []
@@ -346,23 +349,24 @@ def print_sample(chunk: dict):
 
 
 def ingest_file(file_path: str | Path, collection_name: str = collectionName,
-                skip_existing: bool = True, sample_every: int = 0) -> dict:
+                skip_existing: bool = True, sample_every: int = 0,
+                source_name: str = None) -> dict:
     """
     Ingest one PDF into the daily collection. Skips the file if its source is
     already present (idempotent re-runs). Returns the build report + insert count.
 
-    sample_every: if > 0, print full metadata for every Nth chunk across the run
-                  (useful for eyeballing that tagging is correct).
+    sample_every: if > 0, print full metadata for every Nth chunk across the run.
+    source_name:  override the stored source filename (for Streamlit temp uploads).
     """
     global sampleCounter
     path = Path(file_path)
     col = get_collection(collection_name)
-    source = path.name
+    source = source_name or path.name
 
     if skip_existing and col.count_documents({"source": source}) > 0:
         return {"source": source, "skipped": True, "reason": "already present"}
 
-    chunks, report = build_chunks_for_file(path)
+    chunks, report = build_chunks_for_file(path, source_name=source)
     if not chunks:
         report["inserted"] = 0
         report["warnings"].append("No chunks produced.")

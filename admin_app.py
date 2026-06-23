@@ -17,7 +17,6 @@ from user_management import create_user, delete_user, list_users, change_role
 # ── All data management functions from build_index ─────────
 from build import (
     delete_by_source,
-    deduplicate,
     list_sources,
     get_collection,
     embedding,
@@ -318,13 +317,11 @@ st.divider()
 # Tabs
 # ============================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Upload & Index",
     "Delete Documents",
-    "Deduplicate",
     "Browse Sources",
     "Database Stats",
-    "Verify Embeddings",
     "User Management",
     "PnL Periods",
 ])
@@ -366,6 +363,12 @@ with tab1:
         st.info(
             "PnL files are stored as structured rows in `pnl_table` (no vector embedding). "
             "Period is auto-detected from the filename — confirm or override below before indexing."
+        )
+    elif store_type == "context":
+        st.info(
+            "Context PDFs go through the **daily pipeline**: narrative is date-tagged into "
+            "`context_daily`, and the exhibit tables are extracted into `daily_table_data` "
+            "(exact numbers via vision). Dates are read from the document content. PDF only."
         )
     else:
         st.info(f"Files will be added to **{collection_name}**.")
@@ -451,6 +454,53 @@ with tab1:
                             st.success(f"`{uploaded_file.name}` — {n} rows stored as period `{confirmed_period}`")
                         else:
                             st.warning(f"`{uploaded_file.name}` — no rows ingested (period `{confirmed_period}` may already exist)")
+                    except Exception as e:
+                        st.error(f"`{uploaded_file.name}`: {e}")
+                    finally:
+                        temp_path.unlink(missing_ok=True)
+
+        # ── Context: daily pipeline (narrative → context_daily, tables → daily_table_data) ──
+        elif store_type == "context":
+            import daily_data as dd
+            import daily_table_data as dtd
+            from anthropic import Anthropic
+
+            client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+            reindex = "Reindex" in upload_mode
+
+            with st.spinner("Ingesting daily context (narrative + exact tables via vision)..."):
+                for uploaded_file in uploaded_files:
+                    if not uploaded_file.name.lower().endswith(".pdf"):
+                        st.warning(f"`{uploaded_file.name}` skipped — daily context must be a PDF.")
+                        continue
+
+                    suffix = Path(uploaded_file.name).suffix
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp.write(uploaded_file.getbuffer())
+                        temp_path = Path(tmp.name)
+
+                    try:
+                        if reindex:
+                            get_collection("context_daily").delete_many({"source": uploaded_file.name})
+                            get_collection("daily_table_data").delete_many({"source": uploaded_file.name})
+
+                        # 1) Narrative → context_daily   2) Exact-number tables → daily_table_data (3-pass vision)
+                        narr = dd.ingest_file(
+                            temp_path, skip_existing=not reindex, source_name=uploaded_file.name
+                        )
+                        dtd.ingest_tables(
+                            temp_path, client, skip_existing=not reindex, source_name=uploaded_file.name
+                        )
+
+                        # Concise summary: chunks + days
+                        if narr.get("skipped"):
+                            st.info(f"`{uploaded_file.name}` — already ingested (skipped)")
+                        else:
+                            st.success(
+                                f"`{uploaded_file.name}` — {narr.get('inserted', 0)} chunks, "
+                                f"{len(narr.get('days', []))} day(s)"
+                            )
+
                     except Exception as e:
                         st.error(f"`{uploaded_file.name}`: {e}")
                     finally:
@@ -554,81 +604,32 @@ with tab2:
 
         if st.button("Delete Selected File", key="btn_delete"):
             with st.spinner("Processing..."):
-                count = delete_by_source(
-                    selected_source,
-                    del_col_name,
-                    dry_run=dry_run_del,
-                )
+                count = delete_by_source(selected_source, del_col_name, dry_run=dry_run_del)
+                # Context spans two collections — also remove the exact-number tables
+                extra = 0
+                if del_collection == "context":
+                    extra = delete_by_source(
+                        selected_source, "daily_table_data", dry_run=dry_run_del
+                    )
+            targets = f"`{del_col_name}`" + (" + `daily_table_data`" if del_collection == "context" else "")
             if dry_run_del:
                 st.info(
-                    f"Preview: {count} chunks would be deleted "
-                    f"for `{selected_source}`. Uncheck preview to delete."
+                    f"Preview: {count + extra} records would be deleted for "
+                    f"`{selected_source}` from {targets}. Uncheck preview to delete."
                 )
             else:
                 st.success(
-                    f"Deleted {count} chunks for `{selected_source}` "
-                    f"from `{del_col_name}`."
+                    f"Deleted {count + extra} records for `{selected_source}` from {targets}."
                 )
     else:
         st.info("No source files found in this collection.")
 
 
 # ============================================================
-# TAB 3 — Deduplicate
+# TAB 3 — Browse Sources
 # ============================================================
 
 with tab3:
-    st.subheader("Find & Remove Duplicates")
-    st.markdown(
-        "Scans for chunks with identical text content. "
-        "Keeps the first occurrence and removes the rest."
-    )
-
-    dedup_scope = st.radio(
-        "Scope",
-        ["All collections", "Single collection"],
-        key="dedup_scope",
-    )
-
-    if dedup_scope == "Single collection":
-        dedup_cat = st.selectbox(
-            "Collection",
-            list(COLLECTIONS.keys()),
-            key="dedup_collection",
-        )
-        dedup_targets = [COLLECTIONS[dedup_cat][0]]
-    else:
-        dedup_targets = [v[0] for v in COLLECTIONS.values()]
-
-    dry_run_dedup = st.checkbox(
-        "Preview only (dry run)", value=True, key="dedup_dryrun"
-    )
-
-    if st.button("Run Deduplication", key="btn_dedup"):
-        total_removed = 0
-        with st.spinner("Scanning..."):
-            for col_name in dedup_targets:
-                removed = deduplicate(col_name, dry_run=dry_run_dedup)
-                total_removed += removed
-                if dry_run_dedup:
-                    st.info(f"`{col_name}`: {removed} duplicates found.")
-                else:
-                    st.success(f"`{col_name}`: {removed} duplicates removed.")
-
-        if dry_run_dedup:
-            st.info(
-                f"Total duplicates found across all targets: {total_removed}. "
-                f"Uncheck preview to remove."
-            )
-        else:
-            st.success(f"Deduplication complete. Total removed: {total_removed}.")
-
-
-# ============================================================
-# TAB 4 — Browse Sources
-# ============================================================
-
-with tab4:
     st.subheader("Browse Indexed Sources")
     st.markdown("See every source file currently indexed in a collection.")
 
@@ -658,16 +659,19 @@ with tab4:
 
 
 # ============================================================
-# TAB 5 — Database Stats
+# TAB 4 — Database Stats
 # ============================================================
 
-with tab5:
+with tab4:
     st.subheader("Database Status")
     st.markdown("Live document counts across all collections.")
 
     if st.button("Refresh Stats", key="btn_stats"):
         with st.spinner("Fetching..."):
-            for label, (col_name, _) in COLLECTIONS.items():
+            # Vector collections from COLLECTIONS + the structured ones not in that map
+            all_cols = [c for c, _ in COLLECTIONS.values()] + \
+                       ["daily_table_data", "pnl_table", "pnl_summary"]
+            for col_name in all_cols:
                 try:
                     count = get_collection(col_name).count_documents({})
                     st.markdown(
@@ -682,70 +686,9 @@ with tab5:
 
 
 # ============================================================
-# TAB 6 — Verify Embeddings
+# TAB 5 — User Management
 # ============================================================
-
-with tab6:
-    st.subheader("Verify Embeddings")
-    st.markdown(
-        "Checks a sample of documents in each collection to confirm "
-        "embedding dimensions are correct and consistent."
-    )
-
-    verify_scope = st.radio(
-        "Scope",
-        ["All collections", "Single collection"],
-        key="verify_scope",
-    )
-
-    if verify_scope == "Single collection":
-        verify_cat = st.selectbox(
-            "Collection",
-            list(COLLECTIONS.keys()),
-            key="verify_collection",
-        )
-        verify_targets = {verify_cat: COLLECTIONS[verify_cat][0]}
-    else:
-        verify_targets = {k: v[0] for k, v in COLLECTIONS.items()}
-
-    if st.button("Run Verification", key="btn_verify"):
-        provider = os.getenv("EMBEDDING_PROVIDER", "gemini").lower()
-        expected_dim = 3072 if provider == "openai" else 768
-
-        with st.spinner("Checking..."):
-            for cat, col_name in verify_targets.items():
-                collection = get_collection(col_name)
-                samples = list(collection.find(
-                    {"embedding": {"$exists": True}},
-                    {"embedding": 1, "source": 1, "metadata": 1},
-                ).limit(3))
-
-                if not samples:
-                    st.warning(f"`{col_name}`: no embeddings found.")
-                    continue
-
-                dims = set(len(s["embedding"]) for s in samples)
-                dim = list(dims)[0]
-
-                if len(dims) == 1 and dim == expected_dim:
-                    st.success(
-                        f"`{col_name}`: {dim}d embeddings — correct for {provider}."
-                    )
-                elif len(dims) > 1:
-                    st.error(
-                        f"`{col_name}`: inconsistent dimensions {dims}. "
-                        f"Consider re-ingesting this collection."
-                    )
-                else:
-                    st.error(
-                        f"`{col_name}`: {dim}d found, expected {expected_dim}d "
-                        f"for {provider}."
-                    )
-
-# ============================================================
-# TAB 7 — User Management
-# ============================================================
-with tab7:
+with tab5:
     st.subheader("User Management")
 
     # ── Create user ────────────────────────────────────────
@@ -802,10 +745,10 @@ with tab7:
 
 
 # ============================================================
-# TAB 8 — PnL Periods
+# TAB 6 — PnL Periods
 # ============================================================
 
-with tab8:
+with tab6:
     st.subheader("PnL Periods")
     st.markdown(
         "Manage structured PnL data stored in `pnl_table`. "

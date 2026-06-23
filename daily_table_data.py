@@ -264,11 +264,15 @@ def extract_tables_merged(img_b64: str, client: Anthropic, passes: int = visionP
 # ============================================================
 
 def ingest_tables(file_path, client: Anthropic, collection_name: str = marketCollectionName,
-                  skip_existing: bool = True, sample_every: int = 0) -> dict:
-    """Extract every exhibit table in a PDF and store one doc per (date, exhibit)."""
+                  skip_existing: bool = True, sample_every: int = 0,
+                  source_name: str = None) -> dict:
+    """Extract every exhibit table in a PDF and store one doc per (date, exhibit).
+
+    source_name overrides the stored source filename (for Streamlit temp uploads).
+    """
     path = Path(file_path)
     col = get_collection(collection_name)
-    source = path.name
+    source = source_name or path.name
 
     if skip_existing and col.count_documents({"source": source}) > 0:
         return {"source": source, "skipped": True, "reason": "already present"}

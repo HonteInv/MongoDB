@@ -546,13 +546,6 @@ def render_risk_section(result: dict, expanded: bool = True, show_controls: bool
             revision_controls("risk", "Risk Analysis")
 
 
-def render_weekly_section(result: dict, expanded: bool = False):
-    if "weekly" not in result:
-        return
-    with st.expander("Daily Market Data Analysis", expanded=expanded):
-        st.markdown(safe_md(result["weekly"]["analysis"]))
-
-
 def render_stress_test_section(result: dict):
     st_result = result.get("stress_test")
     if not st_result:
@@ -602,7 +595,6 @@ def render_result(result: dict, show_revision_controls: bool = True):
         render_market_section(result, expanded=False, show_controls=show_revision_controls)
         render_performance_section(result, expanded=False, show_controls=show_revision_controls)
         render_risk_section(result, expanded=False, show_controls=show_revision_controls)
-        render_weekly_section(result, expanded=False)
         render_stress_test_section(result)
 
     # other
@@ -615,7 +607,6 @@ def render_result(result: dict, show_revision_controls: bool = True):
             render_market_section(result, expanded=("market_analysis" in result.get("plan", {}).get("intent", "")), show_controls=show_revision_controls)
             render_performance_section(result, expanded=True, show_controls=show_revision_controls)
             render_risk_section(result, expanded=True, show_controls=show_revision_controls)
-            render_weekly_section(result, expanded=False)
 
         render_stress_test_section(result)
 
@@ -628,7 +619,6 @@ def render_result(result: dict, show_revision_controls: bool = True):
         render_market_section(result, expanded=False, show_controls=show_revision_controls)
         render_performance_section(result, expanded=False, show_controls=show_revision_controls)
         render_risk_section(result, expanded=False, show_controls=show_revision_controls)
-        render_weekly_section(result, expanded=False)
         render_stress_test_section(result)
 
     # Debug critique logs 
