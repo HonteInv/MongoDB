@@ -6,7 +6,6 @@ SECTION_LABELS = {
     "market": "Market Context",
     "performance": "Portfolio Performance",
     "risk": "Risk Analysis",
-    "weekly": "Daily Market Data",
 }
 
 def _period_of(result: dict) -> str:
@@ -49,7 +48,7 @@ def _assemble_blocks(result: dict) -> list[tuple[str, str]]:
         blocks.append(("md", result["newsletter"]["newsletter"]))
 
     # sections
-    for key in ("market", "performance", "risk", "weekly"):
+    for key in ("market", "performance", "risk"):
         section = result.get(key)
         if not section or not section.get("analysis"):
             continue

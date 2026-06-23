@@ -153,15 +153,50 @@ class BaseAgent:
 class MarketContextAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Daily-tagged narrative collection (date/section/topic pre-filtering)
         self.context_store = get_vector_store(
-            "context_vectors",
-            "vector_index",
+            "context_daily",
+            "daily_index",
             self.embedding,
         )
+        # Exact-number tables (structured, queried by date — not vectors)
+        self._mongo = MongoClient(os.getenv("MONGO_URI_USER"))
         # CLAUDE_CONTEXT_MODEL env var takes priority; otherwise use the model
         # already resolved and passed in from build_agent_system().
         if os.getenv("CLAUDE_CONTEXT_MODEL"):
             self.model = os.getenv("CLAUDE_CONTEXT_MODEL")
+
+    def _tables_col(self):
+        return self._mongo[os.getenv("MONGO_DB_NAME", "portfolio_rag")]["daily_table_data"]
+
+    def _get_period_tables(self, period: str) -> tuple[str, list[str]]:
+        """
+        Exact month-end closes for the period from daily_table_data. Returns
+        (formatted_block, data_warnings). The block is "" if no tables exist
+        (e.g. before backfill). data_warnings lists any tables flagged incomplete
+        or low-confidence, so the agent can disclose gaps to the user.
+        """
+        col = self._tables_col()
+        days = sorted(col.distinct("report_day", {"report_month": period}))
+        if not days:
+            return "", []
+        last = days[-1]  # month-end snapshot
+        lines = [f"Exact market closes as of {last} (month-end):"]
+        warnings: list[str] = []
+        for doc in col.find({"report_day": last}, {"_id": 0}):
+            q = doc.get("quality", {}) or {}
+            flagged = q.get("incomplete") or (q.get("confidence") or 100) < 95 or q.get("empty_cells")
+            note = "  [DATA NOTE: this table may be incomplete or uncertain]" if flagged else ""
+            if flagged:
+                warnings.append(
+                    f"{doc['exhibit']} ({last}): possible missing/uncertain values "
+                    f"(confidence {q.get('confidence')}%)"
+                )
+            lines.append(f"\n[{doc['exhibit']}]{note}")
+            for row, cols in doc.get("table", {}).items():
+                vals = ", ".join(f"{k}={'?' if v is None else v}" for k, v in cols.items())
+                lines.append(f"  {row}: {vals}")
+        return "\n".join(lines), warnings
 
     def _build_macro_query(self, question: str) -> str:
         """Reframe the question as a macro-focused vector search query."""
@@ -182,42 +217,68 @@ class MarketContextAgent(BaseAgent):
         period = _extract_period(question)
         macro_query = self._build_macro_query(question)
 
-        # Fetch extra docs so we have room to filter by period
-        fetch_k = self.context_k * 3
-        all_docs = self._search(self.context_store, macro_query, k=fetch_k)
-
-        # Post-filter to the detected period if metadata exists on the chunks
+        # ── Narrative: PRE-filtered vector search (the right month, prose only) ──
+        pre_filter: dict = {"content_type": {"$ne": "data_table"}}
         if period:
-            period_docs = [d for d in all_docs if d.metadata.get("report_period") == period]
-            docs = period_docs[:self.context_k] if len(period_docs) >= 5 else all_docs[:self.context_k]
-        else:
-            docs = all_docs[:self.context_k]
+            pre_filter["report_month"] = {"$eq": period}
+        docs = self.context_store.similarity_search(
+            macro_query, k=self.context_k, pre_filter=pre_filter
+        )
+
+        # ── Honesty: if a period was asked for but has no context, say so ──
+        if period and not docs:
+            return {
+                "agent": "MarketContextAgent",
+                "analysis": (
+                    f"No market context is available for {period} in the database. "
+                    f"I won't substitute commentary from other periods."
+                ),
+                "period": period,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         month_label = macro_query.split(" macro")[0] if period else "the relevant period"
 
+        # ── Exact numbers for the period (optional — empty before backfill) ──
+        # A/B toggle: set USE_EXACT_TABLES=false to run narrative-only (no daily_table
+        # numbers) for comparison against the with-numbers version.
+        use_tables = os.getenv("USE_EXACT_TABLES", "true").lower() == "true"
+        tables_block, data_warnings = (
+            self._get_period_tables(period) if (period and use_tables) else ("", [])
+        )
+
         system_prompt = (
             "You are a macro market analyst for a hedge fund. "
-            "You will be given a set of source documents. "
+            "You will be given source documents and, when available, an EXACT MARKET DATA "
+            "block of verified closing levels. "
             "Your ONLY job is to summarize what those documents say. "
-            "Every single claim you make must be directly supported by the provided documents. "
+            "Every single claim you make must be directly supported by the provided material. "
             "Do NOT use any knowledge from your training data. "
             "Do NOT invent events, figures, yields, price moves, or central bank actions. "
-            "If a topic is not covered in the documents, do not mention it. "
-            "If the documents are insufficient, say exactly which topics are missing."
+            "When citing specific levels or numbers, use the EXACT MARKET DATA figures verbatim — "
+            "never estimate a number that is given there. "
+            "If a value is shown as '?' or a table is marked with a DATA NOTE, treat it as "
+            "missing — do not guess it, and briefly flag to the reader that some data was "
+            "incomplete for that table. "
+            "If a topic is not covered in the documents, do not mention it."
         )
 
         user_prompt = f"""
 Source documents from {month_label}:
 
 {chr(10).join(f'---{chr(10)}{doc.page_content}' for doc in docs)}
+{f'''
+---
+EXACT MARKET DATA (use these figures verbatim for any specific levels):
+{tables_block}''' if tables_block else ''}
 
 ---
-Based ONLY on the source documents above, summarize:
+Based ONLY on the material above, summarize:
 1. The key macro events and market-moving developments
 2. Which asset classes were affected and how (rates, FX, equities, commodities)
 3. Any central bank actions or policy shifts mentioned
 
-Do not add anything not stated in the documents above.
+Do not add anything not stated above.
 {f'''
 ---
 REVISION FEEDBACK FROM USER:
@@ -230,6 +291,9 @@ Address this feedback in your revised response. Keep everything that was correct
         return {
             "agent": "MarketContextAgent",
             "analysis": analysis,
+            "period": period,
+            "has_exact_data": bool(tables_block),
+            "data_warnings": data_warnings,   # surfaced to the user if numbers were incomplete
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -397,50 +461,6 @@ Address this feedback in your revised response. Keep everything that was correct
             "period": period,
             "pnl_summary": pnl_summary,
             "critique_log": critique_log,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-
-# ============================================================
-# Weekly Market Data Agent
-# ============================================================
-
-class WeeklyMarketDataAgent(BaseAgent):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.weekly_store = get_vector_store(
-            "daily_vectors",
-            "vector_index",
-            self.embedding,
-        )
-
-    def analyze(self, question: str) -> Dict[str, Any]:
-        search_query = f"{question} daily market data"
-        docs = self._search(self.weekly_store, search_query, k=self.context_k)
-
-        system_prompt = (
-            "You are a market data analyst for a hedge fund. "
-            "Summarize the key daily market trends in the data, focusing on: (1) significant moves in rates, "
-            "FX, equities, and commodities, (2) inflection points or trend breaks, and (3) how the "
-            "daily data fits into the broader macro narrative. "
-            "Pay particular attention to month-end movements, as end-of-month prints can have an "
-            "outsized effect on portfolio valuations. "
-            "Connect data points to each other — e.g. how a rates move influenced FX or equity positioning. "
-            "Strictly use only the provided context."
-        )
-
-        user_prompt = f"""
-Question: {question}
-
-Daily Market Data:
-{''.join(doc.page_content for doc in docs[:20])}
-"""
-
-        analysis = self._call_claude(system_prompt, user_prompt)
-
-        return {
-            "agent": "WeeklyMarketDataAgent",
-            "analysis": analysis,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1004,7 +1024,6 @@ class NewsletterWriterAgent(BaseAgent):
         market_context: str,
         portfolio_performance: str,
         risk_analysis: str,
-        weekly_market_data: str = "",
         pnl_summary: dict | None = None,
         feedback: str = "",
     ) -> Dict[str, Any]:
@@ -1050,9 +1069,6 @@ Question: {question}
 
 Market Context:
 {market_context}
-
-Daily Market Data:
-{weekly_market_data}
 
 Portfolio Performance:
 {portfolio_performance}
@@ -1105,7 +1121,6 @@ class OrchestratorAgent:
 
         self.market = MarketContextAgent(embedding, anthropic_client, context_k, model=self._model)
         self.performance = PortfolioPerformanceAgent(embedding, anthropic_client, context_k, model=self._model)
-        self.weekly = WeeklyMarketDataAgent(embedding, anthropic_client, context_k, model=self._model)
         self.risk = RiskAnalystAgent(embedding, anthropic_client, context_k, model=self._model)
         self.writer = NewsletterWriterAgent(embedding, anthropic_client, context_k, model=self._model)
 
@@ -1156,18 +1171,17 @@ class OrchestratorAgent:
             "Available agents:\n"
             "performance  — portfolio P&L, returns, attribution for a specific period\n"
             "market — macro market context (rates, FX, equities, central banks)\n"
-            "weekly — weekly market data trends\n"
             "risk — risk analysis with DV01, notional, concentration (needs performance + market)\n"
             "newsletter — full investor letter (needs performance + market + risk)\n"
             "stress_test — scenario stress test (needs performance + market)\n\n"
             f"Available data periods: {periods_str}\n\n"
             "Intent → agent mapping (use EXACTLY these agent lists):\n"
-            "  newsletter       → [performance, market, weekly, risk, newsletter]\n"
-            "  market_analysis  → [market, weekly]\n"
+            "  newsletter       → [performance, market, risk, newsletter]\n"
+            "  market_analysis  → [market]\n"
             "  performance      → [performance]\n"
             "  risk_analysis    → [performance, market, risk]\n"
             "  stress_test      → [performance, market, stress_test]\n"
-            "  full_brief       → [performance, market, weekly, risk]\n"
+            "  full_brief       → [performance, market, risk]\n"
             "  qa               → [market]\n\n"
             "response_type rules:\n"
             "  newsletter intent              → response_type: newsletter\n"
@@ -1214,7 +1228,7 @@ class OrchestratorAgent:
             "description": "Full pipeline (planner fallback)",
             "period": _extract_period(query),
             "response_type": "newsletter",
-            "agents": ["performance", "market", "weekly", "risk", "newsletter"],
+            "agents": ["performance", "market", "risk", "newsletter"],
             "reasoning": "fallback",
         }
 
@@ -1256,8 +1270,6 @@ class OrchestratorAgent:
             group1["market"] = asyncio.to_thread(self.market.analyze, query)
         if "performance" in agents_needed:
             group1["performance"] = asyncio.to_thread(self.performance.analyze, query)
-        if "weekly" in agents_needed:
-            group1["weekly"] = asyncio.to_thread(self.weekly.analyze, query)
 
         if group1:
             gathered = await asyncio.gather(*group1.values())
@@ -1282,7 +1294,6 @@ class OrchestratorAgent:
                 result.get("market", {}).get("analysis", ""),
                 result.get("performance", {}).get("analysis", ""),
                 result.get("risk", {}).get("analysis", ""),
-                result.get("weekly", {}).get("analysis", ""),
                 result.get("performance", {}).get("pnl_summary"),
             )
             result["newsletter"] = newsletter_result
@@ -1359,7 +1370,6 @@ class OrchestratorAgent:
                 result.get("market", {}).get("analysis", ""),
                 result.get("performance", {}).get("analysis", ""),
                 result.get("risk", {}).get("analysis", ""),
-                result.get("weekly", {}).get("analysis", ""),
                 result.get("performance", {}).get("pnl_summary"),
                 feedback,
             )
@@ -1381,7 +1391,6 @@ class OrchestratorAgent:
                     result.get("market", {}).get("analysis", ""),
                     result.get("performance", {}).get("analysis", ""),
                     risk_result["analysis"],
-                    result.get("weekly", {}).get("analysis", ""),
                     result.get("performance", {}).get("pnl_summary"),
                 )
                 result["newsletter"] = writer_result
@@ -1400,7 +1409,6 @@ class OrchestratorAgent:
                     result.get("market", {}).get("analysis", ""),
                     perf_result["analysis"],
                     result.get("risk", {}).get("analysis", ""),
-                    result.get("weekly", {}).get("analysis", ""),
                     perf_result.get("pnl_summary"),
                 )
                 result["newsletter"] = writer_result
@@ -1419,7 +1427,6 @@ class OrchestratorAgent:
                     market_result["analysis"],
                     result.get("performance", {}).get("analysis", ""),
                     result.get("risk", {}).get("analysis", ""),
-                    result.get("weekly", {}).get("analysis", ""),
                     result.get("performance", {}).get("pnl_summary"),
                 )
                 result["newsletter"] = writer_result

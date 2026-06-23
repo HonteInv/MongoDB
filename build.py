@@ -73,11 +73,13 @@ def get_collection(collection_name: str):
 # Add new categories here as needed — nothing else to change
 # ============================================================
 
+# NOTE: context now uses the daily pipeline (daily_data.py → context_daily, plus
+# daily_table_data for exact numbers). The mapping below points context at the
+# narrative collection; the admin app handles the second (tables) collection too.
 COLLECTIONS = {
-    "context":            ("context_vectors",   "vector_index"),
+    "context":            ("context_daily",      "daily_index"),
     "pnl":                ("pnl_vectors",        "vector_index"),
     "newsletter":         ("newsletter_vectors", "vector_index"),
-    "weekly_market_data": ("weekly_vectors",     "vector_index"),
 }
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -86,7 +88,6 @@ FOLDER_MAP = {
     "context": BASE_DIR / "data" / "context",
     "pnl": BASE_DIR / "data" / "pnl",
     "newsletter": BASE_DIR / "data" / "newsletters",
-    "weekly_market_data": BASE_DIR / "data" / "weekly_market_data",
 }
 
 # ============================================================

@@ -110,9 +110,6 @@ def _make_example(
         outputs["risk_analysis"] = result["risk"].get("analysis", "")
         outputs["risk_metrics_table"] = result["risk"].get("metrics", "")
 
-    if result.get("weekly"):
-        outputs["weekly_analysis"] = result["weekly"].get("analysis", "")
-
     if result.get("stress_test"):
         st = result["stress_test"]
         outputs["stress_test_tables"]    = st.get("tables", "")
