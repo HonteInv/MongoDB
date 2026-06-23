@@ -7,12 +7,13 @@ import os
 
 def get_latest_opus_model(client, fallback: str = "claude-opus-4-7") -> str:
     """
-    Query the Anthropic API and return the most recent claude-opus-* model
-    available on this API key.
+    Resolve which Claude model to use.
 
-    Models are returned newest-first by the API, so index 0 is always the
-    latest.  Falls back to `fallback` if the API call fails or returns no
-    Opus models.
+    1. If CLAUDE_MODEL is set in the environment, that wins — return it directly.
+       (Set CLAUDE_MODEL=claude-sonnet-4-6 in .env to test cheaply, etc.)
+    2. Otherwise query the Anthropic API and return the most recent claude-opus-*
+       model available on this API key (returned newest-first, so index 0).
+    3. If the API call fails or returns no Opus models, return `fallback`.
 
     Usage:
         from anthropic import Anthropic
@@ -21,6 +22,12 @@ def get_latest_opus_model(client, fallback: str = "claude-opus-4-7") -> str:
         client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
         model  = get_latest_opus_model(client)
     """
+    # 1. Explicit override always wins — no API call needed.
+    override = os.getenv("CLAUDE_MODEL")
+    if override:
+        print(f"  [helper] Using CLAUDE_MODEL override: {override}")
+        return override
+
     try:
         models = client.models.list()
         opus_models = [m.id for m in models.data if "opus" in m.id]
