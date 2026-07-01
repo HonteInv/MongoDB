@@ -80,6 +80,7 @@ COLLECTIONS = {
     "context":            ("context_daily",      "daily_index"),
     "pnl":                ("pnl_vectors",        "vector_index"),
     "newsletter":         ("newsletter_vectors", "vector_index"),
+    "market":             ("market_series",      None),   # structured time-series, no vector index
 }
 
 BASE_DIR = Path(__file__).resolve().parent

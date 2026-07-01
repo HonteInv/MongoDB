@@ -351,8 +351,8 @@ with tab1:
         st.session_state.uploader_key += 1 
 
     uploaded_files = st.file_uploader(
-        "Upload Doc (PDF, Markdown, CSV)",
-        type=["pdf", "md", "csv"],
+        "Upload Doc (PDF, Markdown, CSV, Excel)",
+        type=["pdf", "md", "csv", "xlsx", "xls"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.uploader_key}",
     )
@@ -369,6 +369,14 @@ with tab1:
             "Context PDFs go through the **daily pipeline**: narrative is date-tagged into "
             "`context_daily`, and the exhibit tables are extracted into `daily_table_data` "
             "(exact numbers via vision). Dates are read from the document content. PDF only."
+        )
+    elif store_type == "market":
+        st.info(
+            "Market data files (`.md`, `.csv`, `.xlsx`) are stored as **structured time-series** "
+            "in `market_series` (no vector embedding). Dates are normalized to ISO, frequency "
+            "(daily/weekly) is inferred from date spacing, and columns map via `ticker_map.json`. "
+            "Re-ingesting overlapping dates updates rather than duplicates. Unknown columns are "
+            "reported so they can be added to the map."
         )
     else:
         st.info(f"Files will be added to **{collection_name}**.")
@@ -501,6 +509,37 @@ with tab1:
                                 f"{len(narr.get('days', []))} day(s)"
                             )
 
+                    except Exception as e:
+                        st.error(f"`{uploaded_file.name}`: {e}")
+                    finally:
+                        temp_path.unlink(missing_ok=True)
+
+        # ── Market series: structured time-series (no vector embedding) ──
+        elif store_type == "market":
+            import market_series as ms
+
+            reindex = "Reindex" in upload_mode
+            with st.spinner("Parsing and storing market time-series..."):
+                for uploaded_file in uploaded_files:
+                    suffix = Path(uploaded_file.name).suffix
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp.write(uploaded_file.getbuffer())
+                        temp_path = Path(tmp.name)
+                    try:
+                        if reindex:
+                            get_collection("market_series").delete_many({"source": uploaded_file.name})
+
+                        report = ms.ingest_file(temp_path, source_name=uploaded_file.name)
+
+                        msg = (
+                            f"`{uploaded_file.name}` — {report['written']} rows "
+                            f"({report['frequency']}, {report['date_range'][0]}..{report['date_range'][1]})"
+                        )
+                        if report["unmapped_headers"]:
+                            st.warning(msg + f" · stored, but these columns are unmapped "
+                                             f"(add to ticker_map.json to label/unit them): {report['unmapped_headers']}")
+                        else:
+                            st.success(msg)
                     except Exception as e:
                         st.error(f"`{uploaded_file.name}`: {e}")
                     finally:

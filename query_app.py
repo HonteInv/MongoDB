@@ -600,6 +600,26 @@ def render_stress_test_section(result: dict):
             st.markdown(safe_md(st_result["narrative"]))
 
 
+def render_sources(result: dict):
+    """
+    One overall Sources footer for the whole response — top 5 distinct documents
+    across every agent that retrieved from the corpus (not per-section). Shown for
+    every request type. Silent if nothing was retrieved (e.g. structured-only paths).
+    """
+    seen: list[str] = []
+    for section in result.values():
+        if isinstance(section, dict):
+            for src in section.get("sources", []) or []:
+                if src and src not in seen:
+                    seen.append(src)
+    seen = seen[:5]
+    if not seen:
+        return
+    lines = "\n".join(f"{i}. {s}" for i, s in enumerate(seen, 1))
+    st.markdown("---")
+    st.markdown(f"**Sources (top {len(seen)} documents referenced):**\n\n{lines}")
+
+
 def render_result(result: dict, show_revision_controls: bool = True):
     """
     Render a result dict based on its response_type (newsletter, analysis, chat)
@@ -652,7 +672,10 @@ def render_result(result: dict, show_revision_controls: bool = True):
         render_risk_section(result, expanded=False, show_controls=show_revision_controls)
         render_stress_test_section(result)
 
-    # Debug critique logs 
+    # One overall Sources footer for every response type
+    render_sources(result)
+
+    # Debug critique logs
     if show_revision_controls and st.session_state.get("role") == "admin":
         with st.expander("Debug: Self-Critique Logs", expanded=False):
             for agent_key, lbl in [("performance", "Portfolio Performance"), ("newsletter", "Newsletter")]:
