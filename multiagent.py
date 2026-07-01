@@ -6,7 +6,8 @@ import re
 import time
 import asyncio
 import os
-from datetime import datetime, timezone
+import calendar
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -147,6 +148,92 @@ class BaseAgent:
 
 
 # ============================================================
+# Market Series Agent (daily/weekly numeric time-series → "recent moves")
+# ============================================================
+
+class MarketSeriesAgent:
+    """
+    Grabs the daily/weekly market time-series for the query's period from the
+    structured `market_series` collection and computes DETERMINISTIC changes
+    (yields/swaps in bp, prices in %), labeling fixed-expiry contracts correctly.
+
+    Output is a compact "recent market moves" block that MarketContextAgent folds
+    into its analysis. Numbers here are computed, never model-generated — so the
+    letter can cite them safely. Returns an empty block when there's no data for
+    the period (honest, no fabrication).
+    """
+
+    def __init__(self, model: str = None):
+        self.model = model  # unused today (pure computation) — kept for parity
+
+    def summarize(self, question: str) -> Dict[str, Any]:
+        import market_series as ms
+
+        period = _extract_period(question)
+        empty = {
+            "agent": "MarketSeriesAgent", "moves_block": "", "period": period,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if not period:
+            return empty
+
+        yyyy, mm = int(period[:4]), int(period[5:7])
+        last_day = calendar.monthrange(yyyy, mm)[1]
+        start = f"{period}-01"
+        end = f"{period}-{last_day:02d}"
+        # Reach back ~7 days so the first move has a prior reference point.
+        lookback = (datetime.fromisoformat(start) - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        try:
+            rows = ms.get_range(lookback, end)
+        except Exception as e:
+            print(f"MarketSeriesAgent: market_series query failed ({e})")
+            return empty
+        if not rows:
+            return empty
+
+        # Prefer daily granularity when available; else weekly.
+        freqs = {r["frequency"] for r in rows}
+        freq = "daily" if "daily" in freqs else next(iter(freqs))
+        rows = [r for r in rows if r["frequency"] == freq]
+        rows.sort(key=lambda r: r["date"])
+
+        # Change is measured across the requested month; fall back to the full
+        # lookback window if the month itself has fewer than two observations.
+        month_rows = [r for r in rows if start <= r["date"] <= end]
+        window = month_rows if len(month_rows) >= 2 else rows
+        if len(window) < 2:
+            return empty
+
+        first, last = window[0], window[-1]
+        _, ticker_meta, _ = ms.load_ticker_map()
+
+        lines = [f"RECENT MARKET MOVES (computed from market data, {freq}, "
+                 f"{first['date']} → {last['date']}):"]
+        for ticker in sorted(set(first["series"]) & set(last["series"])):
+            a, b = first["series"][ticker], last["series"][ticker]
+            meta = ticker_meta.get(ticker, {"label": ticker, "unit": "price", "type": "generic"})
+            unit = meta["unit"]
+            if unit == "percent":            # rate quoted in % → change in bp
+                chg_s = f"{(b - a) * 100:+.0f}bp"
+            elif unit == "bp":               # value already in bp → raw difference
+                chg_s = f"{(b - a):+.1f}bp"
+            else:                            # price/level → percent change
+                chg_s = f"{((b - a) / a * 100):+.1f}%" if a else "n/a"
+            tag = " [fixed-expiry contract]" if meta["type"] == "fixed_expiry" else ""
+            lines.append(f"- {meta['label']}: {a:g} → {b:g} ({chg_s}){tag}")
+
+        return {
+            "agent": "MarketSeriesAgent",
+            "moves_block": "\n".join(lines),
+            "period": period,
+            "frequency": freq,
+            "as_of": last["date"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+# ============================================================
 # Market Context Agent
 # ============================================================
 
@@ -161,6 +248,8 @@ class MarketContextAgent(BaseAgent):
         )
         # Exact-number tables (structured, queried by date — not vectors)
         self._mongo = MongoClient(os.getenv("MONGO_URI_USER"))
+        # Daily/weekly market time-series → "recent moves" (structured, deterministic)
+        self.series = MarketSeriesAgent(model=getattr(self, "model", None))
         # CLAUDE_CONTEXT_MODEL env var takes priority; otherwise use the model
         # already resolved and passed in from build_agent_system().
         if os.getenv("CLAUDE_CONTEXT_MODEL"):
@@ -213,7 +302,7 @@ class MarketContextAgent(BaseAgent):
             )
         return "macro market events rates FX equities central bank monetary policy"
 
-    def analyze(self, question: str, feedback: str = "") -> Dict[str, Any]:
+    def analyze(self, question: str, feedback: str = "", market_moves: str = None) -> Dict[str, Any]:
         period = _extract_period(question)
         macro_query = self._build_macro_query(question)
 
@@ -225,6 +314,15 @@ class MarketContextAgent(BaseAgent):
             macro_query, k=self.context_k, pre_filter=pre_filter
         )
 
+        # ── Distinct source documents behind this retrieval (relevance order) ──
+        # Dedupe chunks down to the different PDFs they came from; keep the top 5.
+        source_docs: list[str] = []
+        for doc in docs:
+            src = doc.metadata.get("source")
+            if src and src not in source_docs:
+                source_docs.append(src)
+        source_docs = source_docs[:5]
+
         # ── Honesty: if a period was asked for but has no context, say so ──
         if period and not docs:
             return {
@@ -234,6 +332,7 @@ class MarketContextAgent(BaseAgent):
                     f"I won't substitute commentary from other periods."
                 ),
                 "period": period,
+                "sources": [],
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -247,16 +346,24 @@ class MarketContextAgent(BaseAgent):
             self._get_period_tables(period) if (period and use_tables) else ("", [])
         )
 
+        # ── Recent market moves for the period (computed, deterministic) ──
+        # Passed in for override/testing; otherwise computed from market_series.
+        if market_moves is None:
+            market_moves = self.series.summarize(question).get("moves_block", "")
+
         system_prompt = (
             "You are a macro market analyst for a hedge fund. "
             "You will be given source documents and, when available, an EXACT MARKET DATA "
-            "block of verified closing levels. "
+            "block of verified closing levels and a RECENT MARKET MOVES block of computed "
+            "changes over the period. "
             "Your ONLY job is to summarize what those documents say. "
             "Every single claim you make must be directly supported by the provided material. "
             "Do NOT use any knowledge from your training data. "
             "Do NOT invent events, figures, yields, price moves, or central bank actions. "
             "When citing specific levels or numbers, use the EXACT MARKET DATA figures verbatim — "
             "never estimate a number that is given there. "
+            "The RECENT MARKET MOVES figures are pre-computed changes — use them verbatim when "
+            "describing how instruments moved over the period; do not recalculate them. "
             "If a value is shown as '?' or a table is marked with a DATA NOTE, treat it as "
             "missing — do not guess it, and briefly flag to the reader that some data was "
             "incomplete for that table. "
@@ -271,6 +378,9 @@ Source documents from {month_label}:
 ---
 EXACT MARKET DATA (use these figures verbatim for any specific levels):
 {tables_block}''' if tables_block else ''}
+{f'''
+---
+{market_moves}''' if market_moves else ''}
 
 ---
 Based ONLY on the material above, summarize:
@@ -293,7 +403,9 @@ Address this feedback in your revised response. Keep everything that was correct
             "analysis": analysis,
             "period": period,
             "has_exact_data": bool(tables_block),
+            "has_market_moves": bool(market_moves),
             "data_warnings": data_warnings,   # surfaced to the user if numbers were incomplete
+            "sources": source_docs,           # top-5 distinct documents behind the retrieval
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1040,24 +1152,33 @@ class NewsletterWriterAgent(BaseAgent):
 
         system_prompt = (
             "You are writing a monthly investor letter for a global macro hedge fund. "
-            "Target length: 1,000–1,500 words. Tone: direct, candid, analytical — not defensive or euphemistic. "
+            "Target length: 800–1,200 words. Tone: direct, candid, analytical — modest on the surface "
+            "but firm in conviction; not defensive or euphemistic. "
+            "\n\n"
+            "This letter is a SUMMARY and narrative. The detailed numbers already live in the Performance "
+            "and Risk sections, so do NOT reproduce them here — the reader has them elsewhere.\n"
             "\n\n"
             "STRUCTURE:\n"
-            "1. Opening paragraph: state the monthly return and 2-3 sentence macro summary of what drove the month.\n"
+            "1. Opening paragraph: state the headline monthly return ONCE, then a 2-3 sentence macro summary of what drove the month.\n"
             "2. Body: organized by THEME not by position. Suggested sections: Precious Metals & Miners, "
             "Rates & Duration, Foreign Exchange, Equities, Digital Assets. "
-            "Within each section: lead with P&L impact, then market dynamics, then trading activity.\n"
+            "Within each section: explain the market dynamic and how it affected the book, then the thesis. "
+            "Refer to P&L magnitudes QUALITATIVELY ('the largest contributor', 'a modest drag', 'roughly offset') "
+            "rather than quoting exact dollar figures.\n"
             "3. Outlook: connect current positioning to specific forward catalysts. "
             "Name what needs to happen for the portfolio to benefit AND what would make the thesis wrong.\n"
             "4. Closing: one short paragraph.\n"
+            "\n\n"
+            "NUMBERS POLICY:\n"
+            "- Use the headline monthly return figure in the opening — that one figure is expected.\n"
+            "- Beyond that, AVOID specific dollar P&L figures and line-item attribution. Speak in relative terms.\n"
+            "- Do not duplicate the exact numbers that already appear in the Performance and Risk sections.\n"
             "\n\n"
             "ANALYTICAL STANDARDS:\n"
             "- Explain transmission mechanisms, not just correlations. "
             "Don't say 'oil rose and gold fell' — explain the full chain: why oil moved, how that repriced inflation/rates, how that mechanism hit the position.\n"
             "- Surface cross-asset linkages: which positions were driven by the same underlying force? Which provided natural offsets?\n"
             "- Organize around REGIME PHASES within the month (e.g. 'Early Feb: gold volatility phase, Feb 2–7'), not day-by-day recitation.\n"
-            "- Use exact P&L figures. Never round.\n"
-            "- Omit positions below ~$200k P&L impact unless strategically relevant.\n"
             "- Do NOT list every line item. This is a narrative, not an attribution table.\n"
             "- Never assert macro facts (data releases, yield levels) not present in the provided context."
         )
@@ -1085,15 +1206,15 @@ Address this feedback in your revised response. Keep everything that was correct
 """
 
         rubric = (
-            "1. Opens with monthly return figure and 2-3 sentence macro summary.\n"
+            "1. Opens with the headline monthly return figure and a 2-3 sentence macro summary.\n"
             "2. Body is organized by theme/asset class — NOT a position-by-position list.\n"
-            "3. Each thematic section leads with P&L impact, then market dynamics, then trading activity.\n"
+            "3. P&L is described QUALITATIVELY (relative magnitudes) — no line-item dollar figures beyond the headline return.\n"
             "4. Transmission mechanisms are explained (full causal chain), not just correlations stated.\n"
             "5. Cross-asset linkages are surfaced (which positions were driven by the same force).\n"
             "6. Month is organized around regime phases, not a chronological day-by-day walkthrough.\n"
             "7. Outlook names specific catalysts and acknowledges what would make the thesis wrong.\n"
             "8. No macro facts asserted without support from the provided context.\n"
-            "9. Length is approximately 1,000–1,500 words."
+            "9. Length is approximately 800–1,200 words."
         )
 
         newsletter, critique_log = self._call_claude_with_critique(

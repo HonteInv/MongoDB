@@ -28,13 +28,12 @@ class ValidationAgent:
     DEPENDENTS = {
         "market": ["risk", "newsletter"],
         "performance": ["risk", "newsletter"],
-        "weekly": ["newsletter"],
         "risk": ["newsletter"],
         "newsletter": [],
     }
 
     # Canonical run order — cascade always replays in this order.
-    PIPELINE_ORDER = ["market", "performance", "weekly", "risk", "newsletter"]
+    PIPELINE_ORDER = ["market", "performance", "risk", "newsletter"]
 
     VALID_OWNERS = set(PIPELINE_ORDER)
 
@@ -81,7 +80,6 @@ class ValidationAgent:
             "Sections:\n"
             "  market — macro market context (rates, FX, equities, central banks)\n"
             "  performance  — portfolio P&L, returns, attribution (numbers live here)\n"
-            "  weekly — daily/weekly market data trends\n"
             "  risk — DV01, notional, concentration, stress framing\n"
             "  newsletter — the written investor letter (tone, structure, prose)\n\n"
             f"Sections present in this report: {present}\n\n"
@@ -153,7 +151,7 @@ class ValidationAgent:
         """Deterministic plain-English plan for the confirm step."""
         label = {
             "market": "Market Context", "performance": "Portfolio Performance",
-            "weekly": "Daily Market Data", "risk": "Risk Analysis",
+            "risk": "Risk Analysis",
             "newsletter": "Newsletter",
         }
         downstream = [s for s in dirty if s != owner]
@@ -200,11 +198,6 @@ class ValidationAgent:
                 result["performance"] = await asyncio.to_thread(
                     self.orch.performance.analyze, question, fb("performance")
                 )
-            elif section == "weekly":
-                # WeeklyMarketDataAgent.analyze takes no feedback param — refresh only
-                result["weekly"] = await asyncio.to_thread(
-                    self.orch.weekly.analyze, question
-                )
             elif section == "risk":
                 result["risk"] = await asyncio.to_thread(
                     self.orch.risk.analyze,
@@ -220,7 +213,6 @@ class ValidationAgent:
                     result.get("market", {}).get("analysis", ""),
                     result.get("performance", {}).get("analysis", ""),
                     result.get("risk", {}).get("analysis", ""),
-                    result.get("weekly", {}).get("analysis", ""),
                     result.get("performance", {}).get("pnl_summary"),
                     fb("newsletter"),
                 )
@@ -239,7 +231,7 @@ class ValidationAgent:
     def _build_explanation(self, plan: dict) -> str:
         label = {
             "market": "Market Context", "performance": "Portfolio Performance",
-            "weekly": "Daily Market Data", "risk": "Risk Analysis",
+            "risk": "Risk Analysis",
             "newsletter": "Newsletter",
         }
         ran = ", ".join(label.get(s, s) for s in plan["dirty_set"])
@@ -253,7 +245,7 @@ class ValidationAgent:
     def version_label(plan: dict) -> str:
         """Concise summary of what a revision changed — used as the version-stack label."""
         label = {
-            "market": "market", "performance": "performance", "weekly": "weekly",
+            "market": "market", "performance": "performance",
             "risk": "risk", "newsletter": "newsletter",
         }
         return f"{plan['owner']} revision — {', '.join(label.get(s, s) for s in plan['dirty_set'])}"

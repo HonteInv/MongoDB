@@ -80,6 +80,7 @@ COLLECTIONS = {
     "context":            ("context_daily",      "daily_index"),
     "pnl":                ("pnl_vectors",        "vector_index"),
     "newsletter":         ("newsletter_vectors", "vector_index"),
+    "market":             ("market_series",      None),   # structured time-series, no vector index
 }
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -305,8 +306,8 @@ def delete_by_source(source_filename: str, collection_name: str, dry_run=False):
     dry_run=True shows what would be deleted without deleting anything.
 
     Usage:
-        delete_by_source("report_oct2025.pdf", "context_vectors")
-        delete_by_source("report_oct2025.pdf", "context_vectors", dry_run=True)
+        delete_by_source("report_oct2025.pdf", "context_daily")
+        delete_by_source("report_oct2025.pdf", "context_daily", dry_run=True)
     """
     collection = get_collection(collection_name)
 
@@ -348,7 +349,7 @@ def delete_collection(collection_name: str, confirm=False):
     Requires confirm=True as a safety check.
 
     Usage:
-        delete_collection("context_vectors", confirm=True)
+        delete_collection("context_daily", confirm=True)
     """
     if not confirm:
         print(f"Safety check: pass confirm=True to wipe {collection_name}")
@@ -372,8 +373,8 @@ def deduplicate(collection_name: str, dry_run=False):
     dry_run=True reports duplicates without deleting.
 
     Usage:
-        deduplicate("context_vectors")
-        deduplicate("context_vectors", dry_run=True)
+        deduplicate("context_daily")
+        deduplicate("context_daily", dry_run=True)
     """
     collection = get_collection(collection_name)
     total = collection.count_documents({})
@@ -426,7 +427,7 @@ def list_sources(collection_name: str, silent=False) -> list[str]:
     List all unique source files currently indexed in a collection.
 
     Usage:
-        list_sources("context_vectors")
+        list_sources("context_daily")
         sources = list_sources("pnl_vectors")
     """
     collection = get_collection(collection_name)
@@ -497,7 +498,7 @@ def verify_embeddings(collection_name: str):
     are consistent and match the expected model output.
 
     Usage:
-        verify_embeddings("context_vectors")
+        verify_embeddings("context_daily")
     """
     collection = get_collection(collection_name)
     samples = list(collection.find(
@@ -928,7 +929,7 @@ def get_pnl_summary(report_period: str) -> dict | None:
     return doc
 
 
-def backfill_report_periods(collection_name: str = "context_vectors") -> int:
+def backfill_report_periods(collection_name: str = "context_daily") -> int:
     """
     Add report_period metadata to existing documents that don't have it yet.
     Derives the period from the stored source filename — no re-embedding needed.
@@ -936,7 +937,7 @@ def backfill_report_periods(collection_name: str = "context_vectors") -> int:
 
     Usage:
         backfill_report_periods()
-        backfill_report_periods("context_vectors")
+        backfill_report_periods("context_daily")
     """
     col = get_collection(collection_name)
     total = col.count_documents({})
