@@ -182,6 +182,12 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
     """
     if category not in COLLECTIONS:
         raise ValueError(f"Unknown category '{category}'. Options: {list(COLLECTIONS.keys())}")
+    if category not in FOLDER_MAP:
+        # e.g. "market" is a valid collection but has no ingest folder — it is
+        # ingested via market_series.py, not this generic vector path
+        raise ValueError(
+            f"Category '{category}' has no ingest folder. Options: {list(FOLDER_MAP.keys())}"
+        )
 
     collection_name, index_name = COLLECTIONS[category]
     folder = FOLDER_MAP[category]
@@ -311,13 +317,16 @@ def delete_by_source(source_filename: str, collection_name: str, dry_run=False):
     """
     collection = get_collection(collection_name)
 
-    # Search by both exact match and filename-only match
+    # Search by both exact match and filename-only match.
+    # re.escape: filenames like "PNL [final].md" or "report (1.pdf" are invalid
+    # regexes (crash), and unescaped "." over-matches other filenames.
+    escaped = re.escape(source_filename)
     query = {
         "$or": [
             {"source":                    source_filename},
             {"metadata.source":           source_filename},
-            {"source":                    {"$regex": source_filename, "$options": "i"}},
-            {"metadata.source":           {"$regex": source_filename, "$options": "i"}},
+            {"source":                    {"$regex": escaped, "$options": "i"}},
+            {"metadata.source":           {"$regex": escaped, "$options": "i"}},
             {"metadata.original_filename": source_filename},
         ]
     }
@@ -388,6 +397,10 @@ def deduplicate(collection_name: str, dry_run=False):
 
     for doc in cursor:
         text = doc.get("text", "")
+        # Docs without a text field (structured collections like pnl_table)
+        # would all hash identically and be mass-deleted as "duplicates"
+        if not text:
+            continue
         # Hash the text content — same text = duplicate
         text_hash = hashlib.md5(text.strip().encode()).hexdigest()
 
@@ -618,10 +631,13 @@ def _extract_context_period(filename: str) -> str | None:
     if m:
         return f"20{m.group(3)}-{m.group(1)}"
 
-    # 4. Month name only — infer year from month
+    # 4. Month name only — infer year from month, relative to TODAY (a report
+    # can't be from the future, so months after the current one → last year).
+    # The old hardcoded "2025 if month >= 6 else 2026" expired as time passed.
+    now = datetime.now(timezone.utc)
     for name, num in _CONTEXT_MONTH_MAP.items():
         if re.search(rf'\b{name}\b', s):
-            inferred = "2025" if int(num) >= 6 else "2026"
+            inferred = now.year if int(num) <= now.month else now.year - 1
             return f"{inferred}-{num}"
 
     return None
@@ -633,10 +649,20 @@ def _extract_report_period(filename: str) -> str:
     e.g. PNL_FEB_2026.md → "2026-02", PNL_OCT.md → "2025-10"
     """
     stem = Path(filename).stem.lower()
-    year_match = re.search(r'\b(20\d{2})\b', stem)
+    # (?<!\d)/(?!\d) instead of \b: underscore is a word character, so
+    # \b(20\d{2})\b never matched "pnl_aug_2025" and the year silently fell
+    # back to the CURRENT year for every underscore-separated filename.
+    year_match = re.search(r'(?<!\d)(20\d{2})(?!\d)', stem)
     year = year_match.group(1) if year_match else str(datetime.now(timezone.utc).year)
+    # Full month names first, then abbreviations as standalone tokens.
+    # A bare substring test matched "mar" inside "MARKET_NEUTRAL" → wrong period.
+    # (?<![a-z])/(?![a-z]) instead of \b so "pnl_feb_2026" still matches — the
+    # underscore is a word character, so \bfeb\b would fail there.
+    for full, num in _CONTEXT_MONTH_MAP.items():
+        if len(full) > 4 and re.search(rf'(?<![a-z]){full}(?![a-z])', stem):
+            return f"{year}-{num}"
     for abbr, num in _MONTH_ABBR.items():
-        if abbr in stem:
+        if re.search(rf'(?<![a-z]){abbr}(?![a-z])', stem):
             return f"{year}-{num}"
     return f"{year}-??"
 
@@ -709,9 +735,22 @@ def _extract_aum_summary(cells: list[str]) -> dict | None:
     return summary if summary else None
 
 
+def _convert_date_cells(row: dict) -> dict:
+    """
+    Apply Excel-serial→ISO conversion ONLY to cells in date-named columns
+    ('Start Date' / 'End Date' → start_date / end_date after _normalize_col).
+    Converting the whole file (the old behavior) corrupted any bare 5-digit
+    position size in the 40000–59999 range into a date string.
+    """
+    return {
+        k: (convert_excel_dates(v) if "date" in k else v)
+        for k, v in row.items()
+    }
+
+
 def _parse_pnl_markdown(path: Path) -> tuple[list[dict], dict | None]:
     """Parse a PnL markdown table into (row_dicts, aum_summary | None)."""
-    text = convert_excel_dates(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
     rows = []
     header = None
     summary = None
@@ -738,6 +777,7 @@ def _parse_pnl_markdown(path: Path) -> tuple[list[dict], dict | None]:
 
         if header:
             row = {header[i]: (cells[i] if i < len(cells) else "") for i in range(len(header))}
+            row = _convert_date_cells(row)
             if any(v.strip() for v in row.values()):
                 rows.append(row)
 
@@ -752,17 +792,22 @@ def _parse_pnl_csv(path: Path) -> tuple[list[dict], dict | None]:
     with open(path, encoding="utf-8-sig") as f:  # utf-8-sig strips BOM
         reader = _csv.DictReader(f)
         for row in reader:
-            clean = {_normalize_col(k): convert_excel_dates(str(v).strip())
-                     for k, v in row.items() if k}
-            row_keys = " ".join(clean.keys())
-            if re.search(r'\baum\b', row_keys, re.I):
-                # Build a flat cell list for the summary extractor
-                cells = []
-                for k, v in row.items():
-                    cells.append(k or "")
-                    cells.append(v or "")
-                summary = _extract_aum_summary(cells)
+            # Cell VALUES in file order ("" for ragged/missing cells)
+            values = ["" if v is None else str(v).strip() for v in row.values()]
+
+            # AUM summary row — detected by the FIRST CELL VALUE, mirroring the
+            # markdown parser. The old check scanned column KEYS, which is a
+            # per-file constant: a file with an 'AUM' column dropped every row,
+            # and a real AUM summary row was never detected for CSVs at all.
+            if values and re.search(r'\baum\b', values[0], re.I):
+                summary = _extract_aum_summary(values)
                 continue
+
+            clean = {
+                _normalize_col(k): ("" if v is None else str(v).strip())
+                for k, v in row.items() if k
+            }  # "" for None — str(None) stored the literal string "None"
+            clean = _convert_date_cells(clean)
             if any(v.strip() for v in clean.values()):
                 rows.append(clean)
     return rows, summary

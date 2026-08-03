@@ -302,7 +302,9 @@ def ingest_tables(file_path, client: Anthropic, collection_name: str = marketCol
 
             q = quality.get(name, {})
             # Flag anything uncertain so it can be reviewed / propagated to the user
-            if q.get("incomplete") or (q.get("confidence") or 100) < 98 or q.get("empty_cells"):
+            # (explicit None check — `or 100` would treat a confidence of 0 as 100)
+            conf = q.get("confidence")
+            if q.get("incomplete") or (conf is not None and conf < 98) or q.get("empty_cells"):
                 report["low_confidence"].append(
                     f"{day} · {name}: conf={q.get('confidence')}% "
                     f"incomplete={q.get('incomplete')} empty={len(q.get('empty_cells', []))} "

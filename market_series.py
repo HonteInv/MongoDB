@@ -98,11 +98,12 @@ def to_iso(value) -> str:
     Normalize any supported date encoding to ISO YYYY-MM-DD:
     Excel serial (int/float), M/D/YYYY string, or a real date/Timestamp.
     """
-    # Numeric-looking → Excel serial
+    # Numeric-looking AND in a plausible serial range (≈1954–2073) → Excel serial.
+    # Without the range check, YYYYMMDD ints like 20250103 overflow timedelta.
     s = str(value).strip()
-    if re.fullmatch(r"\d+(\.0+)?", s):
+    if re.fullmatch(r"\d+(\.0+)?", s) and 20_000 <= int(float(s)) <= 63_500:
         return excel_serial_to_iso(s)
-    # Everything else → let pandas parse (handles M/D/YYYY, ISO, Timestamp, datetime)
+    # Everything else → let pandas parse (handles M/D/YYYY, YYYYMMDD, ISO, Timestamp)
     return pd.to_datetime(value).strftime("%Y-%m-%d")
 
 
@@ -235,7 +236,7 @@ def parse_file(path) -> dict:
         "docs": docs,
         "frequency": frequency,
         "unmapped_headers": sorted(set(unmapped)),   # stored under raw name; map later if desired
-        "date_range": (iso_dates[0], iso_dates[-1]) if iso_dates else (None, None),
+        "date_range": (min(iso_dates), max(iso_dates)) if iso_dates else (None, None),
         "source": source,
     }
 
@@ -347,7 +348,12 @@ def ingest_folder(folder, dry_run: bool = False) -> list[dict]:
 
 
 def get_range(start_iso: str, end_iso: str, frequency: str = None) -> list[dict]:
-    """Fetch documents in [start, end], newest instruments merged per date. Prefers daily."""
+    """
+    Fetch documents with date in [start, end], sorted by date ascending.
+    NOTE: with frequency=None a date covered by both a daily and a weekly file
+    returns TWO documents — callers must filter by frequency themselves
+    (multiagent.MarketSeriesAgent does).
+    """
     from build import get_collection
     q = {"date": {"$gte": start_iso, "$lte": end_iso}}
     if frequency:

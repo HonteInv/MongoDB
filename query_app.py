@@ -332,6 +332,11 @@ def get_orchestrator():
     return build_agent_system()
 
 @st.cache_resource
+def get_eval_collector():
+    """One EvalCollector (and one MongoClient) per process — not per generate."""
+    return EvalCollector()
+
+@st.cache_resource
 def get_validator():
     """Validation/revision agent — wraps the shared orchestrator. Created once."""
     from validation_agent import ValidationAgent
@@ -451,9 +456,17 @@ generate = st.button("Generate")
 if generate and query.strip():
     run_started = wayfound.utc_now_iso()
     with st.spinner("Planning and running agents..."):
-        result = asyncio.run(
-            orchestrator.run(query, stress_test_options=stress_options)
-        )
+        try:
+            result = asyncio.run(
+                orchestrator.run(query, stress_test_options=stress_options)
+            )
+        except Exception as run_error:
+            # Wayfound: failed runs matter most to a supervisor — record, then
+            # re-raise so Streamlit surfaces the error exactly as before.
+            recorder = wayfound.start_recorder({}, username=st.session_state.username)
+            if recorder:
+                recorder.record(wayfound.messages_for_failed_run(query, run_error, run_started))
+            raise
 
     # Save to session history (RAM only — private to user)
     hist_entry = {
@@ -477,9 +490,11 @@ if generate and query.strip():
     # auto-save to eval_examples collection for future rating / fine-tuning
     try:
         category = result.get("plan", {}).get("intent") or result.get("response_type", "unknown")
-        EvalCollector().save_example(result, category=category)
+        get_eval_collector().save_example(result, category=category)
     except Exception as _e:
-        pass  # never block the UI for this
+        # never block the UI for this — but a silent pass would hide a total
+        # eval-collection outage, so at least leave a trace in the logs
+        print(f"EvalCollector.save_example failed: {_e}")
 
 elif generate:
     st.warning("Please enter a request.")

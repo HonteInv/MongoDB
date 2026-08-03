@@ -27,9 +27,10 @@ def _meta_line(result: dict) -> str | None:
     if not summary or summary.get("return_pct") is None:
         return None
     ret = summary["return_pct"]
-    start = summary.get("start_aum", 0)
-    end = summary.get("end_aum", 0)
-    total = summary.get("total_pnl", 0)
+    # `or 0` also covers keys present with a null value — .get(k, 0) does not
+    start = summary.get("start_aum") or 0
+    end = summary.get("end_aum") or 0
+    total = summary.get("total_pnl") or 0
     return (
         f"Portfolio Return: {ret:+.2f}%  |  Start AUM: ${start:,.0f}  |  "
         f"End AUM: ${end:,.0f}  |  Total P&L: ${total:,.0f}"
@@ -42,8 +43,8 @@ def _assemble_blocks(result: dict) -> list[tuple[str, str]]:
     if meta:
         blocks.append(("meta", meta))
 
-    # newsletter
-    if result.get("newsletter", {}).get("newsletter"):
+    # newsletter — `or {}` tolerates {"newsletter": None} after a failed writer run
+    if (result.get("newsletter") or {}).get("newsletter"):
         blocks.append(("heading", "Newsletter"))
         blocks.append(("md", result["newsletter"]["newsletter"]))
 
@@ -107,7 +108,12 @@ def build_pdf(result: dict) -> bytes:
     from xhtml2pdf import pisa
     html_doc = _blocks_to_html(_assemble_blocks(result))
     buf = io.BytesIO()
-    pisa.CreatePDF(src=html_doc, dest=buf, encoding="utf-8")
+    status = pisa.CreatePDF(src=html_doc, dest=buf, encoding="utf-8")
+    if status.err:
+        # A silent error here would hand the user a corrupt/empty PDF download
+        raise RuntimeError(
+            f"PDF rendering failed ({status.err} error(s)) — try the DOCX export instead"
+        )
     return buf.getvalue()
 
 

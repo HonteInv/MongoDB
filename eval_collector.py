@@ -55,6 +55,7 @@ USAGE
 """
 
 import os
+import re
 import sys
 import json
 import uuid
@@ -129,7 +130,7 @@ def _make_example(
         # ── Input ────────────────────────────────────────────
         "input": {
             "query":         q,
-            "period":        plan.get("period") or result.get("performance", {}).get("period"),
+            "period":        plan.get("period") or (result.get("performance") or {}).get("period"),
             "response_type": result.get("response_type", ""),
             "intent":        plan.get("intent", ""),
             "agents_run":    plan.get("agents", []),
@@ -230,7 +231,9 @@ class EvalCollector:
         return docs
 
     def get_example(self, example_id: str) -> dict | None:
-        return self._col.find_one({"_id": {"$regex": f"^{example_id}"}})
+        # re.escape: ids are user-supplied prefixes — raw regex chars would let
+        # ".*" match an arbitrary document (or crash on an invalid pattern)
+        return self._col.find_one({"_id": {"$regex": f"^{re.escape(example_id)}"}})
 
     # ── Rate ─────────────────────────────────────────────────
 
@@ -254,7 +257,7 @@ class EvalCollector:
                 raise ValueError(f"All scores must be 1–5, got {score}")
 
         result = self._col.update_one(
-            {"_id": {"$regex": f"^{example_id}"}},
+            {"_id": {"$regex": f"^{re.escape(example_id)}"}},
             {"$set": {
                 "human_rating.overall":  overall,
                 "human_rating.accuracy": accuracy,
@@ -266,7 +269,9 @@ class EvalCollector:
                 "human_rating.notes":    notes,
             }}
         )
-        return result.modified_count == 1
+        # matched_count, not modified_count — re-rating with identical scores
+        # modifies nothing but is still a successful rating of a found document
+        return result.matched_count == 1
 
     # ── Export ───────────────────────────────────────────────
 
@@ -296,19 +301,26 @@ class EvalCollector:
             print(f"  No examples found with rating >= {min_rating}")
             return 0
 
+        written = 0
         with open(path, "w") as f:
             for doc in docs:
                 if format_ == "chat":
                     row = _to_chat_format(doc)
                     if row:
                         f.write(json.dumps(row) + "\n")
+                        written += 1
                 else:
                     # Remove MongoDB _id field for clean export
                     doc.pop("_id", None)
                     f.write(json.dumps(doc, default=str) + "\n")
+                    written += 1
 
-        print(f"  ✓ Exported {len(docs)} examples to {path}")
-        return len(docs)
+        # Count what was WRITTEN — chat format silently skips unsupported
+        # categories, so len(docs) can overstate the file's contents
+        skipped = len(docs) - written
+        print(f"  ✓ Exported {written} examples to {path}"
+              + (f" ({skipped} skipped — category not supported by chat format)" if skipped else ""))
+        return written
 
     # ── Stats ────────────────────────────────────────────────
 
