@@ -29,6 +29,22 @@
 ## PNL 
 This is stored in a separate collection with different logic for accuracy.
 
+## Data Audit (read-only)
+`audit_data.py` scans every collection for residue of the ingestion bugs fixed
+on 2026-08-02 (date-corrupted position sizes, literal "None" cells, rows filed
+under the wrong period, missing/mismatched pnl_summary docs, zero-confidence
+vision tables, wrong-schema context docs, invalid user roles) and reconciles
+`pnl_table` row counts + AUM against the source files in `data/pnl/`.
+
+```
+python audit_data.py                 # console report, exit 1 if errors found
+python audit_data.py --json out.json # also write machine-readable findings
+```
+
+It NEVER writes to MongoDB — every finding names the admin-app action that
+fixes it (usually a Reindex-mode re-upload). Needs `MONGO_URI_USER` (plus
+`MONGO_URI_ADMIN` for the users check) in `.env`; run it wherever the app runs.
+
 ## Wayfound Agent Supervision (optional)
 `query_app.py` can send every run to Wayfound (app.wayfound.ai) so the supervisor
 can review agent behavior: the user query, the planner's routing decision, each
