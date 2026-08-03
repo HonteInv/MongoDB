@@ -27,4 +27,24 @@
 3. 
 
 ## PNL 
-This is stored in a separate collection with different logic for accuracy. 
+This is stored in a separate collection with different logic for accuracy.
+
+## Wayfound Agent Supervision (optional)
+`query_app.py` can send every run to Wayfound (app.wayfound.ai) so the supervisor
+can review agent behavior: the user query, the planner's routing decision, each
+agent's output (with self-critique rounds), and any revision / validation_agent
+loop. One Wayfound session per query; revisions append to the same session.
+
+**Enable** — add to `.env` (off silently when unset):
+```
+WAYFOUND_API_KEY=...        # ask a Wayfound admin to create one
+WAYFOUND_AGENT_ID=...       # optional; defaults to the registered "MongoDB" agent
+```
+
+**Notes**
+- All uploads are fire-and-forget on background threads — a Wayfound outage can
+  never block or break the app. Failures disable recording for that run only.
+- Engine lives in `wayfound_monitor.py`; `multiagent.py` is untouched (agent
+  result dicts already carry per-agent timestamps, which preserve the run timeline).
+- Sessions are tagged with visitor = login username and metadata = plan intent /
+  period / agents, so supervisor recordings are filterable per user and intent. 

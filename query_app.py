@@ -7,6 +7,7 @@ from multiagent import build_agent_system, _extract_period
 from helper import get_latest_opus_model
 from stress_scenarios import STRESS_SCENARIOS
 from eval_collector import EvalCollector
+import wayfound_monitor as wayfound
 
 
 def safe_md(text: str) -> str:
@@ -448,16 +449,26 @@ generate = st.button("Generate")
 # ============================================================
 
 if generate and query.strip():
+    run_started = wayfound.utc_now_iso()
     with st.spinner("Planning and running agents..."):
         result = asyncio.run(
             orchestrator.run(query, stress_test_options=stress_options)
         )
 
     # Save to session history (RAM only — private to user)
-    st.session_state.history.append({
+    hist_entry = {
         "query": query,
         "result": result,
-    })
+    }
+
+    # Wayfound supervision — one session per query, revisions append to it.
+    # No-op unless WAYFOUND_API_KEY is configured; never blocks the UI.
+    recorder = wayfound.start_recorder(result, username=st.session_state.username)
+    if recorder:
+        recorder.record(wayfound.messages_for_run(query, result, run_started))
+        hist_entry["wayfound"] = recorder
+
+    st.session_state.history.append(hist_entry)
 
     # clear any prepared exports — they belong to the previous result
     for k in ("export_pdf", "export_docx", "export_pdf_name", "export_docx_name"):
@@ -486,11 +497,20 @@ if st.session_state.get("pending_revision") and st.session_state.history:
         "market": "Market Context",
     }
     label = label_map.get(rev["section"], rev["section"].title())
+    rev_started = wayfound.utc_now_iso()
     with st.spinner(f"Revising {label}..."):
         updated = asyncio.run(
             orchestrator.revise_section(rev["section"], rev["feedback"], current)
         )
     st.session_state.history[-1]["result"] = updated
+
+    # Wayfound: append the feedback + only the re-run sections to this query's session
+    recorder = st.session_state.history[-1].get("wayfound")
+    if recorder:
+        recorder.record(wayfound.messages_for_revision(
+            rev["feedback"], updated, rev_started,
+            section=rev["section"], via="section_revise",
+        ))
     # Prepared exports are now stale — drop them
     for k in ("export_pdf", "export_docx", "export_pdf_name", "export_docx_name"):
         st.session_state.pop(k, None)
@@ -513,9 +533,16 @@ if st.session_state.get("pending_validation_execute") and st.session_state.histo
         "result": current,
     })
 
+    exec_started = wayfound.utc_now_iso()
     with st.spinner("Applying revision..."):
         updated = asyncio.run(validator.execute_revision(plan, current))
     hist_entry["result"] = updated
+
+    # Wayfound: append the re-run sections + the agent's own explanation
+    recorder = hist_entry.get("wayfound")
+    if recorder:
+        recorder.record(wayfound.messages_for_validation_execution(updated, exec_started))
+
     st.session_state.pop("validation_complaint_text", None)  # clear the box
     st.rerun()
 
@@ -754,8 +781,15 @@ def render_validation_agent(hist_entry: dict):
     )
     if st.button("Analyze request", key="btn_validation_analyze"):
         if complaint.strip():
+            asked_at = wayfound.utc_now_iso()
             with st.spinner("Working out what needs to change..."):
                 plan = asyncio.run(validator.plan_revision(complaint.strip(), result))
+            # Wayfound: record the complaint + proposed plan (even if later cancelled)
+            recorder = hist_entry.get("wayfound")
+            if recorder:
+                recorder.record(wayfound.messages_for_validation_plan(
+                    complaint.strip(), plan, asked_at
+                ))
             st.session_state["pending_validation_plan"] = plan
             st.rerun()
         else:
