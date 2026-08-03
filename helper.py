@@ -5,7 +5,7 @@ helper.py — shared utilities for the Portfolio AI system.
 import os
 
 
-def get_latest_opus_model(client, fallback: str = "claude-opus-4-7") -> str:
+def get_latest_opus_model(client, fallback: str = "claude-opus-5") -> str:
     """
     Resolve which Claude model to use.
 
@@ -29,8 +29,9 @@ def get_latest_opus_model(client, fallback: str = "claude-opus-4-7") -> str:
         return override
 
     try:
-        models = client.models.list()
-        opus_models = [m.id for m in models.data if "opus" in m.id]
+        # Iterate the page object directly — it auto-paginates across all pages.
+        # (`models.data` is only the FIRST page and could miss newer models.)
+        opus_models = [m.id for m in client.models.list() if "opus" in m.id]
         if opus_models:
             latest = opus_models[0]
             print(f"  [helper] Latest Opus model resolved: {latest}")

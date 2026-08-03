@@ -314,6 +314,21 @@ def messages_for_validation_plan(complaint: str, plan: dict, asked_at: str) -> l
     ]
 
 
+def messages_for_failed_run(query: str, error: Exception, started_at: str) -> list:
+    """A run that crashed before producing a result — the supervisor should
+    see failures, not just successes. Content is the exception repr only."""
+    return [
+        _msg("user_message", query, started_at),
+        _msg(
+            "assistant_message",
+            f"Run failed with an unhandled error: {type(error).__name__}: {error}",
+            utc_now_iso(),
+            label="run_error",
+            description="Pipeline raised before producing a result",
+        ),
+    ]
+
+
 def messages_for_validation_execution(updated_result: dict, started_at: str) -> list:
     """A confirmed validation plan: the re-run sections plus the agent's own
     explanation of what it changed."""

@@ -93,10 +93,10 @@ class BaseAgent:
         """
         Ask the model to critique a draft against a rubric.
         Returns a short critique — either 'PASS' or a list of specific issues.
-        Uses the base model (haiku) to keep costs low.
+        Uses the already-resolved agent model — no extra model-lookup API call.
         """
         response = self.client.messages.create(
-            model=os.getenv("CLAUDE_MODEL") or get_latest_opus_model(self.client),
+            model=self.model,
             max_tokens=512,
             system=(
                 "You are a strict editorial reviewer. "
@@ -274,7 +274,9 @@ class MarketContextAgent(BaseAgent):
         warnings: list[str] = []
         for doc in col.find({"report_day": last}, {"_id": 0}):
             q = doc.get("quality", {}) or {}
-            flagged = q.get("incomplete") or (q.get("confidence") or 100) < 95 or q.get("empty_cells")
+            # Explicit None check — `or 100` would treat a confidence of 0 as 100
+            conf = q.get("confidence")
+            flagged = q.get("incomplete") or (conf is not None and conf < 95) or q.get("empty_cells")
             note = "  [DATA NOTE: this table may be incomplete or uncertain]" if flagged else ""
             if flagged:
                 warnings.append(
@@ -715,11 +717,13 @@ class RiskAnalystAgent(BaseAgent):
 
         # Section 1: P&L attribution
         lines.append("── P&L ATTRIBUTION BY THEME ──")
-        lines.append(f"{'Theme':<25} {'P&L':>14}  {'% of Total':>10}  Direction")
+        lines.append(f"{'Theme':<25} {'P&L':>14}  {'% of Total':>10}  Result")
         lines.append("-" * 60)
         for theme, val in sorted(theme_pnl.items(), key=lambda x: -abs(x[1])):
             pct = (val / total_pnl_abs * 100) if total_pnl_abs else 0
-            direction = "▲ Long" if val > 0 else "▼ Short"
+            # P&L sign says gain/loss — it does NOT say whether the book is
+            # long or short, so don't label it that way in the prompt data.
+            direction = "▲ Gain" if val > 0 else "▼ Loss"
             lines.append(f"{theme:<25} ${val:>13,.0f}  {pct:>+9.1f}%  {direction}")
         total_computed = sum(theme_pnl.values())
         lines.append("-" * 60)
@@ -870,7 +874,7 @@ class RiskAnalystAgent(BaseAgent):
                     # Long duration: positive DV01 loses when rates rise
                     impact = -exposure * rate_move
                     exposure_str = f"${exposure:>10,.0f} DV01"
-                    move_str = f"{rate_move:+d}bps"
+                    move_str = f"{rate_move:+.0f}bps"  # tolerates float bp moves
 
             elif pos_type == "NOTIONAL":
                 # Try ticker-specific override first
@@ -1324,7 +1328,7 @@ class OrchestratorAgent:
 
         try:
             response = self._anthropic.messages.create(
-                model=os.getenv("CLAUDE_MODEL") or get_latest_opus_model(self._anthropic),
+                model=self._model,
                 max_tokens=300,
                 system=system_prompt,
                 messages=[{"role": "user", "content": f"Query: {query}"}],

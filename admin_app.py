@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
@@ -427,9 +428,21 @@ with tab1:
                         placeholder="e.g. 155000000",
                         key=f"end_aum_{uf.name}",
                     )
+                # Guarded parse — an unparseable value must not crash the whole
+                # page at render time (this runs on every keystroke commit)
+                def _parse_aum(label: str, raw: str, fname=uf.name):
+                    raw = raw.strip()
+                    if not raw:
+                        return None
+                    try:
+                        return float(raw.replace(",", "").replace("$", ""))
+                    except ValueError:
+                        st.error(f"{label} for `{fname}`: '{raw}' is not a number — override ignored.")
+                        return None
+
                 aum_overrides[uf.name] = {
-                    "start": float(start_val.replace(",", "").replace("$", "")) if start_val.strip() else None,
-                    "end":   float(end_val.replace(",", "").replace("$", ""))   if end_val.strip()   else None,
+                    "start": _parse_aum("Start AUM", start_val),
+                    "end":   _parse_aum("End AUM", end_val),
                 }
 
     if uploaded_files and st.button("Index Document", key="btn_upload"):
@@ -440,6 +453,15 @@ with tab1:
                 for uploaded_file in uploaded_files:
                     suffix = Path(uploaded_file.name).suffix
                     confirmed_period = period_overrides.get(uploaded_file.name)
+                    # Reject malformed periods before any write — "2026-??" (no
+                    # month token in filename) or "" would store rows under a
+                    # key no query path can ever match
+                    if not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", confirmed_period or ""):
+                        st.error(
+                            f"`{uploaded_file.name}` — invalid period '{confirmed_period}' "
+                            f"(need YYYY-MM). Fix the period field above; file skipped."
+                        )
+                        continue
                     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                         tmp.write(uploaded_file.getbuffer())
                         temp_path = Path(tmp.name)
@@ -473,7 +495,6 @@ with tab1:
             import daily_table_data as dtd
             from anthropic import Anthropic
 
-            client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
             reindex = "Reindex" in upload_mode
 
             with st.spinner("Ingesting daily context (narrative + exact tables via vision)..."):
@@ -488,6 +509,10 @@ with tab1:
                         temp_path = Path(tmp.name)
 
                     try:
+                        # Inside the try: a missing CLAUDE_API_KEY raises here and
+                        # becomes a per-file st.error instead of a full-page crash
+                        client = Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+
                         if reindex:
                             get_collection("context_daily").delete_many({"source": uploaded_file.name})
                             get_collection("daily_table_data").delete_many({"source": uploaded_file.name})
@@ -508,6 +533,10 @@ with tab1:
                                 f"`{uploaded_file.name}` — {narr.get('inserted', 0)} chunks, "
                                 f"{len(narr.get('days', []))} day(s)"
                             )
+                        # Surface pipeline warnings — a PDF that produced 0 chunks
+                        # previously rendered as a green success with no diagnostics
+                        for w in narr.get("warnings", []) or []:
+                            st.warning(f"`{uploaded_file.name}` — {w}")
 
                     except Exception as e:
                         st.error(f"`{uploaded_file.name}`: {e}")
@@ -627,8 +656,14 @@ with tab2:
             sources = list_sources(del_col_name, silent=True)
             source_filenames = sorted(set(Path(s).name for s in sources if s))
             st.session_state["del_sources"] = source_filenames
+            st.session_state["del_sources_col"] = del_col_name  # which collection they came from
 
-    source_filenames = st.session_state.get("del_sources", [])
+    # Loaded list is only valid for the collection it was loaded from — switching
+    # the selectbox previously kept the old filenames and deleted from the wrong place
+    if st.session_state.get("del_sources_col") != del_col_name:
+        source_filenames = []
+    else:
+        source_filenames = st.session_state.get("del_sources", [])
 
     if source_filenames:
         selected_source = st.selectbox(
@@ -743,8 +778,12 @@ with tab5:
     if st.button("Create User", key="btn_create_user"):
         if new_username and new_password:
             try:
-                create_user(new_username, new_password, new_role)
-                st.success(f"Created {new_role} user: {new_username}")
+                # create_user returns False when the username already exists —
+                # previously "no exception" was misreported as success
+                if create_user(new_username, new_password, new_role):
+                    st.success(f"Created {new_role} user: {new_username}")
+                else:
+                    st.error(f"User '{new_username}' already exists — nothing changed.")
             except Exception as e:
                 st.error(f"Failed: {e}")
         else:
@@ -755,32 +794,37 @@ with tab5:
     # ── List + delete users ────────────────────────────────
     st.markdown("**Current Users**")
 
+    # Load into session_state and render OUTSIDE the Refresh handler: a nested
+    # button never fires (on its click-rerun the outer Refresh is False, so the
+    # Remove button was never even re-instantiated — users could not be deleted)
     if st.button("Refresh Users", key="btn_refresh_users"):
-        client = MongoClient(os.getenv("MONGO_URI_ADMIN"))
-        users = list(
-            client[os.getenv("MONGO_DB_NAME", "portfolio_rag")]["users"]
-            .find({}, {"username": 1, "role": 1, "created_at": 1})
+        st.session_state["user_list"] = list(
+            get_collection("users").find({}, {"username": 1, "role": 1, "created_at": 1})
         )
 
-        for u in users:
-            col1, col2, col3 = st.columns([3, 2, 1])
-            with col1:
-                st.markdown(
-                    f'<div class="source-item">{u["username"]}</div>',
-                    unsafe_allow_html=True
-                )
-            with col2:
-                st.markdown(
-                    f'<div class="source-item">{u["role"]}</div>',
-                    unsafe_allow_html=True
-                )
-            with col3:
-                # Prevent admin from deleting themselves
-                if u["username"] != st.session_state.username:
-                    if st.button("Remove", key=f"del_user_{u['username']}"):
-                        delete_user(u["username"])
-                        st.success(f"Removed {u['username']}")
-                        st.rerun()
+    for u in st.session_state.get("user_list", []):
+        col1, col2, col3 = st.columns([3, 2, 1])
+        with col1:
+            st.markdown(
+                f'<div class="source-item">{u["username"]}</div>',
+                unsafe_allow_html=True
+            )
+        with col2:
+            st.markdown(
+                f'<div class="source-item">{u.get("role", "?")}</div>',
+                unsafe_allow_html=True
+            )
+        with col3:
+            # Prevent admin from deleting themselves
+            if u["username"] != st.session_state.username:
+                if st.button("Remove", key=f"del_user_{u['username']}"):
+                    delete_user(u["username"])
+                    st.session_state["user_list"] = [
+                        x for x in st.session_state["user_list"]
+                        if x["username"] != u["username"]
+                    ]
+                    st.success(f"Removed {u['username']}")
+                    st.rerun()
 
 
 # ============================================================
