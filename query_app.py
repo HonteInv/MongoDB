@@ -574,9 +574,9 @@ def render_plan_badge(result: dict):
         badge_parts.append(f"agents: {', '.join(agents_run)}")
     if reasoning and reasoning != "fallback":
         badge_parts.append(f"_{reasoning}_")
-    st.caption("  ·  ".join(badge_parts))
+    st.caption("  |  ".join(badge_parts))
     if desc:
-        st.caption(f"↳ {desc}")
+        st.caption(f"- {desc}")
 
 
 def render_market_section(result: dict, expanded: bool = True, show_controls: bool = True):
@@ -676,7 +676,7 @@ def render_result(result: dict, show_revision_controls: bool = True):
             f"{r['section']} ×{sum(1 for x in revisions if x['section'] == r['section'])}"
             for r in {r['section']: r for r in revisions}.values()
         )
-        st.caption(f"✏ {len(revisions)} revision(s) — {rev_summary}")
+        st.caption(f"Edited: {len(revisions)} revision(s) — {rev_summary}")
 
     # Newsletter format
     if response_type == "newsletter" and result.get("newsletter"):
@@ -812,7 +812,7 @@ def render_validation_agent(hist_entry: dict):
 
     # ── Explanation of the last revision ──
     if result.get("validation_explanation"):
-        st.caption(f"✓ {result['validation_explanation']}")
+        st.caption(result["validation_explanation"])
 def render_export_controls(result: dict):
     """
     Download the full result as PDF or DOCX. Lazy: nothing is generated until

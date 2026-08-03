@@ -340,7 +340,7 @@ sampleCounter = 0
 def print_sample(chunk: dict):
     """Print one chunk's filter metadata + a text snippet — for spot-checking tags."""
     snippet = chunk["text"].split("\n", 1)[-1][:90].replace("\n", " ")
-    print(f"    ── sample chunk #{sampleCounter} ──")
+    print(f"    -- sample chunk #{sampleCounter} --")
     print(f"       report_day={chunk['report_day']}  report_month={chunk['report_month']}")
     print(f"       section={chunk['section']}  region={chunk['region']}  content_type={chunk['content_type']}")
     print(f"       topic={chunk['topic']}")
@@ -443,12 +443,12 @@ def verify(collection_name: str = collectionName) -> dict:
 
 def print_file_result(res: dict):
     if res.get("skipped"):
-        print(f"  · {res['source']}: skipped (already present)")
+        print(f"  - {res['source']}: skipped (already present)")
     elif res.get("error"):
-        print(f"  ✗ {res['source']}: ERROR {res['error']}")
+        print(f"  {res['source']}: ERROR {res['error']}")
     else:
         flag = "" if res.get("detected_daily") else "  ⚠ no daily headers"
-        print(f"  ✓ {res['source']}: {res.get('inserted', 0)} chunks, "
+        print(f"  {res['source']}: {res.get('inserted', 0)} chunks, "
               f"{len(res.get('days', []))} day(s){flag}")
         for w in res.get("warnings", []):
             print(f"      ! {w}")
@@ -466,7 +466,7 @@ def print_verify(collection_name: str = collectionName):
     print(f"  regions:             {v['region_counts']}")
     print(f"  topics:              {v['topic_counts']}")
     if v["sources_without_day"]:
-        print(f"  ⚠ sources missing daily tags: {v['sources_without_day']}")
+        print(f"  WARNING: sources missing daily tags: {v['sources_without_day']}")
 
 
 # ============================================================
@@ -479,6 +479,6 @@ if __name__ == "__main__":
         print("  sample_every: print full metadata for every Nth chunk (default 20, 0 = off)")
         sys.exit(1)
     sample_every = int(sys.argv[2]) if len(sys.argv) > 2 else 20
-    print(f"Ingesting PDFs from: {sys.argv[1]} → {collectionName}  (sampling every {sample_every} chunks)")
+    print(f"Ingesting PDFs from: {sys.argv[1]} -> {collectionName}  (sampling every {sample_every} chunks)")
     reingest_all(sys.argv[1], sample_every=sample_every)
     print_verify()

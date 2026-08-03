@@ -209,7 +209,7 @@ class MarketSeriesAgent:
         _, ticker_meta, _ = ms.load_ticker_map()
 
         lines = [f"RECENT MARKET MOVES (computed from market data, {freq}, "
-                 f"{first['date']} → {last['date']}):"]
+                 f"{first['date']} -> {last['date']}):"]
         for ticker in sorted(set(first["series"]) & set(last["series"])):
             a, b = first["series"][ticker], last["series"][ticker]
             meta = ticker_meta.get(ticker, {"label": ticker, "unit": "price", "type": "generic"})
@@ -221,7 +221,7 @@ class MarketSeriesAgent:
             else:                            # price/level → percent change
                 chg_s = f"{((b - a) / a * 100):+.1f}%" if a else "n/a"
             tag = " [fixed-expiry contract]" if meta["type"] == "fixed_expiry" else ""
-            lines.append(f"- {meta['label']}: {a:g} → {b:g} ({chg_s}){tag}")
+            lines.append(f"- {meta['label']}: {a:g} -> {b:g} ({chg_s}){tag}")
 
         return {
             "agent": "MarketSeriesAgent",
@@ -716,14 +716,14 @@ class RiskAnalystAgent(BaseAgent):
         lines = [f"PORTFOLIO RISK METRICS — {period}", ""]
 
         # Section 1: P&L attribution
-        lines.append("── P&L ATTRIBUTION BY THEME ──")
+        lines.append("-- P&L ATTRIBUTION BY THEME --")
         lines.append(f"{'Theme':<25} {'P&L':>14}  {'% of Total':>10}  Result")
         lines.append("-" * 60)
         for theme, val in sorted(theme_pnl.items(), key=lambda x: -abs(x[1])):
             pct = (val / total_pnl_abs * 100) if total_pnl_abs else 0
             # P&L sign says gain/loss — it does NOT say whether the book is
             # long or short, so don't label it that way in the prompt data.
-            direction = "▲ Gain" if val > 0 else "▼ Loss"
+            direction = "Gain" if val > 0 else "Loss"
             lines.append(f"{theme:<25} ${val:>13,.0f}  {pct:>+9.1f}%  {direction}")
         total_computed = sum(theme_pnl.values())
         lines.append("-" * 60)
@@ -732,7 +732,7 @@ class RiskAnalystAgent(BaseAgent):
 
         # Section 2: Rates DV01
         if dv01_end:
-            lines.append("── RATES DV01 EXPOSURE ──")
+            lines.append("-- RATES DV01 EXPOSURE --")
             lines.append(f"Net DV01  (directional, all same sign = all long):  ${dv01_end:>12,.0f}")
             lines.append(f"Gross DV01 (risk magnitude, sum of |DV01|):         ${dv01_gross:>12,.0f}")
             net_change = dv01_end - dv01_beg
@@ -757,7 +757,7 @@ class RiskAnalystAgent(BaseAgent):
 
         # Section 3: Notional concentration
         if top_longs or top_shorts:
-            lines.append("── LARGEST NOTIONAL POSITIONS (ending) ──")
+            lines.append("-- LARGEST NOTIONAL POSITIONS (ending) --")
             if top_longs:
                 lines.append("  Top longs:")
                 for name, val in top_longs:
@@ -769,11 +769,11 @@ class RiskAnalystAgent(BaseAgent):
             lines.append("")
 
         # Section 4: Contributors / detractors
-        lines.append("── TOP P&L CONTRIBUTORS ──")
+        lines.append("-- TOP P&L CONTRIBUTORS --")
         for name, theme, val in contributors:
             lines.append(f"{name:<35} ${val:>+14,.0f}  ({theme})")
         lines.append("")
-        lines.append("── TOP P&L DETRACTORS ──")
+        lines.append("-- TOP P&L DETRACTORS --")
         for name, theme, val in detractors:
             lines.append(f"{name:<35} ${val:>+14,.0f}  ({theme})")
         lines.append("")
@@ -781,7 +781,7 @@ class RiskAnalystAgent(BaseAgent):
         # Section 5: Concentration flag
         top3_pnl = sum(abs(p[2]) for p in contributors)
         concentration_pct = top3_pnl / total_pnl_abs * 100 if total_pnl_abs else 0
-        lines.append(f"── CONCENTRATION ──")
+        lines.append("-- CONCENTRATION --")
         lines.append(f"Top 3 positions account for {concentration_pct:.0f}% of gross P&L")
 
         return "\n".join(lines)
@@ -1342,7 +1342,7 @@ class OrchestratorAgent:
             if match:
                 plan = json.loads(match.group())
                 if "agents" in plan and "response_type" in plan:
-                    print(f"  Planner → intent={plan.get('intent')} agents={plan.get('agents')}")
+                    print(f"  Planner -> intent={plan.get('intent')} agents={plan.get('agents')}")
                     return plan
         except Exception as e:
             print(f"  Planner failed ({e}) — using full pipeline fallback")

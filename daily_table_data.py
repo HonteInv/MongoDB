@@ -365,7 +365,7 @@ def get_exhibit(report_day: str, exhibit: str = None,
 
 def print_sample(record: dict):
     rows = list(record["table"].keys())
-    print(f"    ── sample: {record['report_day']} · {record['exhibit']} ──")
+    print(f"    -- sample: {record['report_day']} - {record['exhibit']} --")
     print(f"       rows: {rows[:6]}{'…' if len(rows) > 6 else ''}")
     first = next(iter(record["table"].values()), {})
     print(f"       first row cols: {first}")
@@ -373,14 +373,14 @@ def print_sample(record: dict):
 
 def print_file_result(res: dict):
     if res.get("skipped"):
-        print(f"  · {res['source']}: skipped (already present)")
+        print(f"  - {res['source']}: skipped (already present)")
     elif res.get("error"):
-        print(f"  ✗ {res['source']}: ERROR {res['error']}")
+        print(f"  {res['source']}: ERROR {res['error']}")
     else:
-        print(f"  ✓ {res['source']}: {res['docs']} exhibit table(s) from "
+        print(f"  {res['source']}: {res['docs']} exhibit table(s) from "
               f"{res['exhibit_pages']} page(s)")
         for lc in res.get("low_confidence", []):
-            print(f"      ⚠ low confidence: {lc}")
+            print(f"      WARNING: low confidence: {lc}")
         for w in res.get("warnings", []):
             print(f"      ! {w}")
 
@@ -402,9 +402,9 @@ def verify_market_data(collection_name: str = marketCollectionName):
     print(f"  distinct days:        {len(days)}  range {(days[0], days[-1]) if days else None}")
     print(f"  exhibit types:        {exhibits}")
     print(f"  avg confidence:       {avg_conf}%  (multi-read agreement)")
-    print(f"  incomplete tables:    {incomplete}  ← may be missing a section")
+    print(f"  incomplete tables:    {incomplete}  <- may be missing a section")
     print(f"  tables w/ empty cells:{has_empty}")
-    print(f"  tables w/ conflicts:  {has_conflict}  ← reads disagreed on a value")
+    print(f"  tables w/ conflicts:  {has_conflict}  <- reads disagreed on a value")
 
 
 # ============================================================
@@ -416,6 +416,6 @@ if __name__ == "__main__":
         print("Usage: python daily_table_data.py <source_dir> [sample_every]")
         sys.exit(1)
     sample_every = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-    print(f"Extracting exhibit tables from: {sys.argv[1]} → {marketCollectionName}")
+    print(f"Extracting exhibit tables from: {sys.argv[1]} -> {marketCollectionName}")
     reingest_all_tables(sys.argv[1], sample_every=sample_every)
     verify_market_data()

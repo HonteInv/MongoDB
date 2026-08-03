@@ -205,7 +205,7 @@ class EvalCollector:
         """
         doc = _make_example(result, category)
         self._col.insert_one(doc)
-        print(f"  ✓ Saved eval example [{doc['_id'][:8]}] category={category}")
+        print(f"  Saved eval example [{doc['_id'][:8]}] category={category}")
         return doc["_id"]
 
     # ── Read ─────────────────────────────────────────────────
@@ -318,7 +318,7 @@ class EvalCollector:
         # Count what was WRITTEN — chat format silently skips unsupported
         # categories, so len(docs) can overstate the file's contents
         skipped = len(docs) - written
-        print(f"  ✓ Exported {written} examples to {path}"
+        print(f"  Exported {written} examples to {path}"
               + (f" ({skipped} skipped — category not supported by chat format)" if skipped else ""))
         return written
 
@@ -633,7 +633,7 @@ def cmd_show(args):
         out = doc.get("output", {})
         for key, val in out.items():
             if val and isinstance(val, str):
-                print(f"\n── {key.upper()} ──")
+                print(f"\n-- {key.upper()} --")
                 print(val[:2000] + ("..." if len(val) > 2000 else ""))
     print()
 
@@ -671,7 +671,7 @@ def cmd_rate(args):
         query  = (doc.get("input") or {}).get("query", "")
         period = (doc.get("input") or {}).get("period", "?")
 
-        print(f"\n{'─' * 60}")
+        print(f"\n{'-' * 60}")
         print(f"  ID: {eid}  |  Category: {cat}  |  Period: {period}")
         print(f"  Query: {_truncate(query, 100)}")
         wc = doc.get("word_counts", {})
@@ -710,7 +710,7 @@ def cmd_rate(args):
                 doc["_id"], overall, accuracy, insight, tone, fmt,
                 rated_by=rated_by, notes=notes,
             )
-            print(f"  ✓ Saved." if ok else "  ✗ Not found — skipping.")
+            print("  Saved." if ok else "  NOT FOUND - skipping.")
 
         except KeyboardInterrupt:
             print("\n\nRating session ended.")
@@ -727,7 +727,7 @@ def cmd_export(args):
     fmt      = getattr(args, "format", "chat")
     n = collector.export_jsonl(path, category=category, min_rating=min_r, format_=fmt)
     if n:
-        print(f"  Exported {n} examples → {path}")
+        print(f"  Exported {n} examples -> {path}")
 
 
 def cmd_stats(args):

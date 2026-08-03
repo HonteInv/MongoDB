@@ -565,7 +565,7 @@ with tab1:
                             f"({report['frequency']}, {report['date_range'][0]}..{report['date_range'][1]})"
                         )
                         if report["unmapped_headers"]:
-                            st.warning(msg + f" · stored, but these columns are unmapped "
+                            st.warning(msg + f" - stored, but these columns are unmapped "
                                              f"(add to ticker_map.json to label/unit them): {report['unmapped_headers']}")
                         else:
                             st.success(msg)

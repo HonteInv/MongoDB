@@ -196,7 +196,7 @@ def ingest_folder(category: str, chunk_size=1000, chunk_overlap=200):
         print(f"Folder not found: {folder}")
         return
 
-    print(f"\nIngesting folder: {folder.name} → {collection_name}")
+    print(f"\nIngesting folder: {folder.name} -> {collection_name}")
 
     # Get list of sources already in the collection to avoid duplicates
     existing = set(list_sources(collection_name, silent=True))
@@ -261,7 +261,7 @@ def ingest_file(file_path: str | Path, category: str, chunk_size=1000, chunk_ove
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    print(f"\nIngesting file: {path.name} → {collection_name}")
+    print(f"\nIngesting file: {path.name} -> {collection_name}")
 
     # Check if already indexed
     existing = list_sources(collection_name, silent=True)
@@ -852,7 +852,7 @@ def ingest_pnl_structured(
     if report_period is None:
         report_period = _extract_report_period(display_name)
 
-    print(f"\nIngesting PnL: {display_name} → period={report_period}")
+    print(f"\nIngesting PnL: {display_name} -> period={report_period}")
 
     col = get_collection("pnl_table")
     existing = col.count_documents({"report_period": report_period})

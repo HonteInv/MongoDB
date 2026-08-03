@@ -85,7 +85,7 @@ def change_role(username: str, new_role: str) -> bool:
         {"$set": {"role": new_role}}
     )
     if result.matched_count:  # matched — already-set roles are not "not found"
-        print(f"  Role updated for {username} → {new_role}")
+        print(f"  Role updated for {username} -> {new_role}")
         return True
     print(f"  User '{username}' not found.")
     return False

@@ -275,7 +275,7 @@ def ingest_file(path, source_name: str = None, dry_run: bool = False) -> dict:
     }
 
     if parsed["unmapped_headers"]:
-        print(f"  ⓘ unmapped columns stored under raw names (map in ticker_map.json to label/unit them): "
+        print(f"  (i) unmapped columns stored under raw names (map in ticker_map.json to label/unit them): "
               f"{parsed['unmapped_headers']}")
 
     if dry_run:
@@ -302,7 +302,7 @@ def ingest_file(path, source_name: str = None, dry_run: bool = False) -> dict:
             upsert=True,
         )
     report["written"] = len(parsed["docs"])
-    print(f"  ✓ {report['written']} rows upserted ({parsed['frequency']}, "
+    print(f"  {report['written']} rows upserted ({parsed['frequency']}, "
           f"{parsed['date_range'][0]}..{parsed['date_range'][1]}) from {parsed['source']}")
     return report
 
@@ -334,16 +334,16 @@ def ingest_folder(folder, dry_run: bool = False) -> list[dict]:
             reports.append(rep)
             all_unmapped.update(rep["unmapped_headers"])
         except Exception as e:
-            print(f"  ✗ ERROR: {e}")
+            print(f"  ERROR: {e}")
 
     total_rows = sum(r["written"] if not dry_run else r["rows"] for r in reports)
     print(f"\n=== SUMMARY ===")
     print(f"files: {len(reports)}/{len(files)}   rows {'parsed' if dry_run else 'written'}: {total_rows}")
     if all_unmapped:
-        print(f"ⓘ unmapped columns across folder (stored under raw names; map in ticker_map.json "
+        print(f"(i) unmapped columns across folder (stored under raw names; map in ticker_map.json "
               f"to give them a label/unit): {sorted(all_unmapped)}")
     else:
-        print("all columns mapped ✓")
+        print("all columns mapped OK")
     return reports
 
 
