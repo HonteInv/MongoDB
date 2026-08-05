@@ -51,10 +51,14 @@ can review agent behavior: the user query, the planner's routing decision, each
 agent's output (with self-critique rounds), and any revision / validation_agent
 loop. One Wayfound session per query; revisions append to the same session.
 
-**Enable** — add to `.env` (off silently when unset):
+Supervision is **on by default** — the API key and agent id are hardcoded in
+`wayfound_monitor.py`, so every deployment records with no extra configuration.
+
+**Overrides** (all optional — `.env` locally, or the host's secret store):
 ```
-WAYFOUND_API_KEY=...        # ask a Wayfound admin to create one
-WAYFOUND_AGENT_ID=...       # optional; defaults to the registered "MongoDB" agent
+WAYFOUND_API_KEY=...     # use a rotated key without editing code
+WAYFOUND_AGENT_ID=...    # record against a different Wayfound agent
+WAYFOUND_DISABLED=true   # turn supervision off entirely
 ```
 
 **Notes**

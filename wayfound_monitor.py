@@ -19,17 +19,37 @@ Engine only — all UI lives in query_app.py. multiagent.py is untouched: the
 orchestrator's result dict already carries a completion timestamp per agent,
 which is enough to reconstruct the run timeline without instrumenting agents.
 
-Configuration (.env):
-    WAYFOUND_API_KEY   — required to enable; ask a Wayfound admin to create one
-    WAYFOUND_AGENT_ID  — optional; defaults to the registered "MongoDB" agent
+Configuration — supervision is ON by default (credentials are baked in below,
+so every deployment records with no extra setup). All env vars are optional:
+    WAYFOUND_API_KEY   — use a rotated key without editing code
+    WAYFOUND_AGENT_ID  — record against a different Wayfound agent
+    WAYFOUND_DISABLED  — "true" turns supervision off entirely
 """
 
 import os
 import threading
 from datetime import datetime, timezone
 
-# The "MongoDB" agent registered in Wayfound (Agents → connection page).
+# ── Wayfound credentials ─────────────────────────────────────────────────
+# Hardcoded so supervision needs no per-deployment configuration (owner's
+# choice, same pattern as MacroBot's setSecrets()). The env vars still win
+# when set, so rotating the key never requires a code change.
+#
+# NOTE for anyone reading this in the repo: this key grants read access to
+# recorded sessions, and those transcripts contain portfolio positions, P&L,
+# and AUM figures. If repo access changes, rotate it at
+# app.wayfound.ai → API and the old key stops working.
+DEFAULT_API_KEY = "645c2f8b-c159-4b58-aa17-dbc1aa397226"   # key "new_wf_080326"
+
+# The "HonTe Portfolio AI" agent registered in Wayfound (Agents → connection).
 DEFAULT_AGENT_ID = "fb0d89cf-f0c1-4936-b3a9-9dd9bf7b315a"
+
+
+def _api_key() -> str | None:
+    """The key to authenticate with, or None when supervision is switched off."""
+    if os.getenv("WAYFOUND_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return None
+    return os.getenv("WAYFOUND_API_KEY") or DEFAULT_API_KEY
 
 # Wayfound analyzes full transcripts, but bound single messages so a giant
 # retrieval or table block can't balloon the payload.
@@ -59,19 +79,19 @@ def utc_now_iso() -> str:
 
 
 def wayfound_available() -> bool:
-    """True when the SDK is installed and an API key is configured."""
+    """True when the SDK is installed and supervision has not been disabled."""
     global _availability
     if _availability is None:
-        if not os.getenv("WAYFOUND_API_KEY"):
-            _availability = False
+        if not _api_key():
+            _availability = False   # WAYFOUND_DISABLED is set
         else:
             try:
                 import wayfound  # noqa: F401
                 _availability = True
             except ImportError:
                 print(
-                    "Wayfound: WAYFOUND_API_KEY is set but the SDK is not "
-                    "installed — `pip install wayfound` to enable supervision."
+                    "Wayfound: the SDK is not installed — "
+                    "`pip install wayfound` to enable supervision."
                 )
                 _availability = False
     return _availability
@@ -92,8 +112,8 @@ class WayfoundRecorder:
         from wayfound import Session
 
         self._session = Session(
-            wayfound_api_key=os.getenv("WAYFOUND_API_KEY"),
-            agent_id=os.getenv("WAYFOUND_AGENT_ID", DEFAULT_AGENT_ID),
+            wayfound_api_key=_api_key(),
+            agent_id=os.getenv("WAYFOUND_AGENT_ID") or DEFAULT_AGENT_ID,
             visitor_id=visitor_id,
             visitor_display_name=visitor_display_name,
             metadata=metadata,
